@@ -280,7 +280,7 @@
         byRole[r] + ' 次</em></div>').join('');
 
     B().setHTML(
-      '<a class="back-link" href="#/home">‹ 返回首页</a>' +
+      '<a class="back-link" href="#/home">‹ 返回</a>' +
       '<header class="page-head"><h1>训练场</h1>' +
       '<div class="sub">Boss 战练语法辨析，拆弹练句子结构</div></header>' +
 
@@ -326,7 +326,7 @@
       '<div class="e-txt">还没有题目，无法生成 Boss<br>到「导入」页导入题目后，每个考点会自动成为一个 Boss</div></div>';
 
     B().setHTML(
-      '<a class="back-link" href="#/games">‹ 返回训练场</a>' +
+      '<a class="back-link" href="#/games">‹ 返回</a>' +
       '<header class="page-head"><h1>选择 Boss</h1>' +
       '<div class="sub">答对掉血 2 格，答错回血 1 格；血空通关，按战绩评星</div></header>' +
       items
@@ -387,7 +387,7 @@
     }
 
     B().setHTML(
-      '<a class="back-link" href="#/boss">‹ 撤退</a>' +
+      '<a class="back-link" href="#/boss">‹ 返回</a>' +
       '<div class="boss-head' + (answered && !ok ? ' shake' : '') + '">' +
       '<div class="boss-name">' + esc(boss.name) + '</div>' +
       '<div class="boss-sub">第 ' + (boss.idx + 1) + ' / ' + boss.items.length +
@@ -516,7 +516,7 @@
         byRole[r] + ' 次</em></div>').join('');
 
     B().setHTML(
-      '<a class="back-link" href="#/games">‹ 返回训练场</a>' +
+      '<a class="back-link" href="#/games">‹ 返回</a>' +
       '<header class="page-head"><h1>长难句拆弹</h1>' +
       '<div class="sub">点句子块 → 贴成分标签 → 判定；贴错可反复改</div></header>' +
       (!all.length
@@ -666,12 +666,12 @@
       /* si=0 且列表空 = 该难度还没导入句子；否则才是真正做完 */
       const empty = bomb.si === 0;
       B().setHTML(
-        '<a class="back-link" href="#/bomb">‹ 返回选关</a>' +
+        '<a class="back-link" href="#/bomb">‹ 返回</a>' +
         (empty
           ? '<div class="finish-card"><div class="f-ico">📭</div><h2>难度 ' + bomb.lv + ' 还没有句子</h2>' +
           '<div class="f-sub">复制提示词发给 AI 生成切块 JSON，导入时选这个难度即可</div>' +
           '<div class="btn-row"><a class="btn btn-primary" href="#/bomb-import">去导入句子</a>' +
-          '<a class="btn btn-ghost" href="#/bomb">返回选关</a></div></div>'
+          '<a class="btn btn-ghost back-link" href="#/bomb">‹ 返回</a></div></div>'
           : '<div class="finish-card"><div class="f-ico">💥</div><h2>本难度拆弹完成！</h2>' +
           '<div class="f-sub">难度 ' + bomb.lv + ' 的句子全部处理完毕</div>' +
           '<div class="btn-row"><a class="btn btn-primary" href="#/bomb">换个难度</a>' +
@@ -792,7 +792,7 @@
     }
 
     B().setHTML(
-      '<a class="back-link" href="#/bomb">‹ 返回选关</a>' +
+      '<a class="back-link" href="#/bomb">‹ 返回</a>' +
       '<div class="quiz-progress-txt"><span>难度 ' + bomb.lv + ' · 第 ' + (bomb.si + 1) +
       ' / ' + list.length + ' 句' +
       ((s.type && s.type.length) ? ' · ' + esc(s.type.join('/')) : '') +
@@ -1212,7 +1212,7 @@
   function renderBombImport() {
     boss = null; bomb = null;
     B().setHTML(
-      '<a class="back-link" href="#/bomb">‹ 返回选关</a>' +
+      '<a class="back-link" href="#/bomb">‹ 返回</a>' +
       '<header class="page-head"><h1>批量导入拆弹句</h1>' +
       '<div class="sub">复制提示词 → 发给 AI → 粘贴生成的 JSON → 解析导入</div></header>' +
       (bombImp.message
@@ -1258,7 +1258,7 @@
         '<button class="btn btn-ghost" data-g="bomb-custom-clear" style="margin-top:10px">清空全部句子</button>';
     }
     B().setHTML(
-      '<a class="back-link" href="#/bomb">‹ 返回选关</a>' +
+      '<a class="back-link" href="#/bomb">‹ 返回</a>' +
       '<header class="page-head"><h1>管理我的句子</h1>' +
       '<div class="sub">查看、删除已导入的句子</div></header>' +
       (bombImp.message ? '<div class="import-success">' + esc(bombImp.message) + '</div>' : '') +
