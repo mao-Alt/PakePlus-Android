@@ -49,100 +49,300 @@
     return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
+  /* 假名 / 日文词字符类（词边界判定用，含半角假名） */
+  const KANA_CHAR = /[ぁ-んァ-ヶｦ-ﾟ]/;
+  const JP_WORD_CHAR = /[ぁ-んァ-ヶｦ-ﾟ一-龯㐀-䶿々〆〤ーｰ]/;
+  /* 单假名短语法命中后，允许跟随的助词（其余假名一律视为仍在词内） */
+  const PARTICLE_AFTER = /^[かがさたなはまやらわとでにのをもねよぜぞばぱ]$/;
+
+  /* 括号配对表：全角/半角圆括号、［］、【】、{} */
+  const BRACKET_CLOSE = {
+    '（': '）', '(': ')',
+    '［': '］', '[': ']',
+    '【': '】', '{': '}'
+  };
+
   /**
-   * 考点名称 → 正则数组
-   * 「～／〜」首尾是装饰，中间是通配；「（）」可选；「・／」多变体
-   * 例：～際（は） → /際(?:は)?/ ；～さえ～ば → /さえ.{0,10}?ば/
+   * 常见音便・缩略别名表（key 已归一化：去～、去空格、括号统一成全角（））
+   * variantsOf() 优先查此表，命中则直接用显式形式，不走括号解析。
    */
-  function variantsOf(name) {
-    return String(name).split(/[・／]/).map(function (v) {
-      const s = v.trim().replace(/^[〜～]+/, '').replace(/[〜～]+$/, '');
-      if (!s) return null;
-      let re = '', core = '', buf = '';
-      const optionals = [];
-      const flush = function () {
-        if (buf) { re += escRe(buf); core += buf; buf = ''; }
-      };
-      let i = 0;
-      while (i < s.length) {
-        const ch = s[i];
-        if (ch === '（' || ch === '(') {
-          const close = s.indexOf(ch === '（' ? '）' : ')', i);
-          if (close > i) {
-            flush();
-            const inner = s.slice(i + 1, close);
-            re += '(?:' + escRe(inner) + ')?';
-            optionals.push(inner);
-            i = close + 1;
-            continue;
-          }
-        }
-        if (ch === '～' || ch === '〜') { flush(); re += '.{0,10}?'; i++; continue; }
-        buf += ch; i++;
+  const ALIAS_TABLE = [
+    { key: 'ている', forms: ['ている', 'てる'] },
+    { key: 'ておく', forms: ['ておく', 'とく'] },
+    { key: 'てしまう', forms: ['てしまう', 'ちゃう', 'じゃう'] },
+    { key: '（よ）うではないか', forms: ['うではないか', 'ようではないか', 'よではないか'] }
+  ];
+
+  /** 假名扩展：括号内出现这些假名时追加常见变体（原形式始终保留） */
+  const KANA_VARIANTS = {
+    'よ': ['よう', 'う']
+  };
+
+  /** 顶层「・／」变体切分（不切括号内部的 ・／） */
+  function splitTopVariants(name) {
+    const out = [];
+    let buf = '', depth = 0;
+    String(name).split('').forEach(function (ch) {
+      if (BRACKET_CLOSE[ch]) { depth++; buf += ch; return; }
+      if (ch === '）' || ch === ')' || ch === '］' || ch === ']' ||
+        ch === '】' || ch === '}') {
+        depth = Math.max(0, depth - 1);
+        buf += ch;
+        return;
       }
-      flush();
-      if (core.length < 2) {
-        // 核心太短易误报（如 ～上（で）），把可选部分并入必选再试
-        if (optionals.length) {
-          const merged = core + optionals.join('');
-          if (merged.length >= 2) {
-            try { return new RegExp(escRe(merged), 'g'); } catch (e) { return null; }
-          }
-        }
-        return null;
-      }
-      try { return new RegExp(re, 'g'); } catch (e) { return null; }
-    }).filter(Boolean);
+      if (depth === 0 && (ch === '・' || ch === '／')) { out.push(buf); buf = ''; return; }
+      buf += ch;
+    });
+    if (buf.trim()) out.push(buf);
+    return out;
   }
 
-  /** 扫描文章，返回 { hits:[{start,end,surface,card,extra}], points:[...] } */
+  /**
+   * 归一化核心骨架集合：去～、去空格、去掉括号组（连同括号内内容），
+   * 按顶层变体展开。用于 EXTRA_GRAMMAR 与题库卡片之间的同语法点判定。
+   */
+  function normCores(name) {
+    const set = {};
+    splitTopVariants(name).forEach(function (v) {
+      const s = v
+        .replace(/[〜～]/g, '')
+        .replace(/[\s　]+/g, '')
+        .replace(/[（(\[【{][^（）()\[\]【】{}]*[）)\]】}]/g, '');
+      if (s) set[s] = 1;
+    });
+    return Object.keys(set);
+  }
+
+  /** 语法点身份键：归一化核心相同即视为同一语法点 */
+  function gramKeyOf(name) {
+    const cores = normCores(name);
+    return cores.length ? cores.slice().sort().join('∣') : String(name);
+  }
+
+  /** 括号内容 → 候选集合：原内容（・／拆分、去空格）+ 假名变体；空串由整组 (...)? 表达 */
+  function bracketCandidates(inner) {
+    const set = {};
+    inner.split(/[・／]/).forEach(function (piece) {
+      const p = piece.replace(/[\s　]+/g, '');
+      if (!p) return;
+      set[p] = 1;
+      (KANA_VARIANTS[p] || []).forEach(function (v2) { set[v2] = 1; });
+    });
+    return Object.keys(set).map(escRe);
+  }
+
+  /** 别名表查询：命中返回 RegExp，否则返回 null */
+  function lookupAlias(variant) {
+    const key = variant.trim()
+      .replace(/[\s　]+/g, '')
+      .replace(/[〜～]/g, '')
+      .replace(/[（(\[【{]/g, '（')
+      .replace(/[）)\]】}]/g, '）');
+    for (let i = 0; i < ALIAS_TABLE.length; i++) {
+      if (ALIAS_TABLE[i].key !== key) continue;
+      const forms = ALIAS_TABLE[i].forms.slice()
+        .sort(function (a, b) { return b.length - a.length; });
+      const re = new RegExp('(?:' + forms.map(escRe).join('|') + ')', 'g');
+      re._hasTilde = /[〜～]/.test(variant);
+      re._hasBracket = key.indexOf('（') !== -1;
+      re._brkPos = re._hasBracket ? '前' : '';
+      re._core = forms[0];
+      re._boundary = false;
+      return re;
+    }
+    return null;
+  }
+
+  /**
+   * 单个变体 → 骨架精确匹配 RegExp：
+   *  - 括号外骨架逐字精确；括号组 → (?:候选1|候选2|...)? （整组可空）
+   *  - 首尾～不参与匹配；中间～折叠后 → 不跨句通配 [^。！？!?\n]{0,10}?
+   * 元数据挂在正则对象上：_hasTilde / _hasBracket / _brkPos / _core / _boundary
+   */
+  function compileVariant(variant) {
+    const hasTilde = /[〜～]/.test(variant);
+    const s = variant.trim()
+      .replace(/^[\s　]*[〜～]+[\s　]*/, '')
+      .replace(/[\s　]*[〜～]+[\s　]*$/, '')
+      .replace(/[〜～]+/g, '～');
+
+    const parts = [], kinds = [];
+    let buf = '', core = '', hasBracket = false;
+    const flush = function () {
+      if (buf) { parts.push(escRe(buf)); kinds.push('L'); core += buf; buf = ''; }
+    };
+
+    let i = 0;
+    while (i < s.length) {
+      const ch = s[i];
+      const close = BRACKET_CLOSE[ch];
+      if (close) {
+        const end = s.indexOf(close, i + 1);
+        if (end > i) {
+          flush();
+          const cands = bracketCandidates(s.slice(i + 1, end));
+          parts.push(cands.length ? '(?:' + cands.join('|') + ')?' : '');
+          kinds.push('B');
+          hasBracket = true;
+          i = end + 1;
+          continue;
+        }
+      }
+      if (ch === '～') {
+        flush();
+        parts.push('[^。！？!?\\n]{0,10}?');
+        kinds.push('W');
+        i++;
+        continue;
+      }
+      buf += ch;
+      i++;
+    }
+    flush();
+    if (!core) return null;
+
+    /* 括号位置：首个字面之前=前，末个字面之后=後，其余=中 */
+    const firstL = kinds.indexOf('L'), lastL = kinds.lastIndexOf('L');
+    const pos = [];
+    kinds.forEach(function (k, idx) {
+      if (k === 'B') pos.push(idx < firstL ? '前' : idx > lastL ? '後' : '中');
+    });
+
+    let re;
+    try { re = new RegExp(parts.join(''), 'g'); } catch (e) { return null; }
+    re._hasTilde = hasTilde;
+    re._hasBracket = hasBracket;
+    re._brkPos = pos.join(',');
+    re._core = core;
+    /* 单假名短语法加词边界（如 ～う 不得命中 思う）；汉字骨架（際/上 等）不受限 */
+    re._boundary = core.length === 1 && KANA_CHAR.test(core);
+    return re;
+  }
+
+  /**
+   * 考点名称 → 正则数组（保持 RegExp[] 返回类型，元数据挂在正则对象上）
+   * 流程：顶层・／变体 → 别名表优先 → 括号骨架解析
+   */
+  function variantsOf(name) {
+    const out = [];
+    splitTopVariants(String(name)).forEach(function (v) {
+      if (!v.replace(/[〜～\s　]/g, '')) return;
+      let re = null;
+      try { re = lookupAlias(v) || compileVariant(v); } catch (e) { re = null; }
+      if (re) out.push(re);
+    });
+    return out;
+  }
+
+  /** 单假名短语法的词边界：前不接日文词字符，后不接（助词之外的）假名 */
+  function boundaryOK(text, start, end) {
+    const p = text.charAt(start - 1);
+    if (p && JP_WORD_CHAR.test(p)) return false;
+    const q = text.charAt(end);
+    if (q && KANA_CHAR.test(q) && !PARTICLE_AFTER.test(q)) return false;
+    return true;
+  }
+
+  /** 用户显式标记为重点的卡片（字段预留）；冲突时优先于普通卡片 */
+  function isKeyPoint(card) {
+    return !!(card && (card.star || card.starred || card.important ||
+      card.keyPoint || card.marked));
+  }
+
+  /** 扫描文章，返回 { hits:[{start,end,surface,card,extra,key,pri}], points:[...] } */
   function analyze(text) {
     const cards = Store.getCards();
     const matchers = [];
+    const knownCores = {};   // 题库已覆盖的归一化核心骨架（长度 >= 2）
+
+    /* 题库卡片：内部也按归一化核心去重，同骨架卡片不重复建匹配器 */
     cards.forEach(function (c) {
-      variantsOf(c.name).forEach(function (re) { matchers.push({ card: c, re: re }); });
-    });
-    EXTRA_GRAMMAR.forEach(function (x) {
-      if (cards.some(function (c) { return c.name === x.name; })) return;
-      try { matchers.push({ extra: x, re: new RegExp(x.re, 'g') }); } catch (e) { }
+      const cores = normCores(c.name);
+      if (cores.some(function (v) { return v.length >= 2 && knownCores[v]; })) return;
+      cores.forEach(function (v) { if (v.length >= 2) knownCores[v] = 1; });
+      const key = gramKeyOf(c.name);
+      variantsOf(c.name).forEach(function (re) {
+        matchers.push({ card: c, extra: null, re: re, key: key });
+      });
     });
 
+    /* EXTRA_GRAMMAR 与题库按归一化核心去重（不再按 name 全等判断） */
+    EXTRA_GRAMMAR.forEach(function (x) {
+      const cores = normCores(x.name);
+      if (cores.some(function (v) { return v.length >= 2 && knownCores[v]; })) return;
+      try {
+        matchers.push({ card: null, extra: x, re: new RegExp(x.re, 'g'), key: gramKeyOf(x.name) });
+      } catch (e) { }
+    });
+
+    /* ---- 扫描全部原始命中 ---- */
     const hits = [];
+    const seen = {};   // 语法点层面去重：key#start-end
     matchers.forEach(function (m) {
-      m.re.lastIndex = 0;
+      const re = m.re;
+      re.lastIndex = 0;
       let mt;
-      while ((mt = m.re.exec(text))) {
-        if (!mt[0]) { m.re.lastIndex++; continue; }
+      while ((mt = re.exec(text))) {
+        if (re.lastIndex === mt.index) re.lastIndex++;
+        if (!mt[0]) continue;
+        const start = mt.index, end = start + mt[0].length;
+        /* 单假名短语法词边界约束 */
+        if (re._boundary && !boundaryOK(text, start, end)) continue;
+        /* 第一层（语法点层面）去重：同一语法点同一区间只保留一个 */
+        const dk = m.key + '#' + start + '-' + end;
+        if (seen[dk]) continue;
+        seen[dk] = 1;
+        /* 冲突优先级：长语法（区间长度，排序时体现）＞ 带～ ＞ 带括号 ＞ 重点标记 ＞ 题库卡片 */
+        let pri = 0;
+        if (re._hasTilde) pri += 8;
+        if (re._hasBracket) pri += 4;
+        if (isKeyPoint(m.card)) pri += 2;
+        if (m.card) pri += 1;
         hits.push({
-          start: mt.index, end: mt.index + mt[0].length, surface: mt[0],
-          card: m.card || null, extra: m.extra || null
+          start: start, end: end, surface: mt[0],
+          card: m.card, extra: m.extra, key: m.key, pri: pri
         });
-        if (m.re.lastIndex === mt.index) m.re.lastIndex++;
       }
     });
 
-    /* 去重叠：按起点排序，同起点取最长，跳过与已接受区间重叠的 */
+    /* ---- 第二层（区间层面）去重叠：起点升序、同起点长度降序、再按优先级 ---- */
     hits.sort(function (a, b) {
-      return a.start - b.start || (b.end - b.start) - (a.end - a.start);
+      return a.start - b.start ||
+        (b.end - b.start) - (a.end - a.start) ||
+        b.pri - a.pri;
     });
     const accepted = [];
-    let lastEnd = -1;
     hits.forEach(function (h) {
-      if (h.start >= lastEnd) { accepted.push(h); lastEnd = h.end; }
+      for (let i = accepted.length - 1; i >= 0; i--) {
+        const a = accepted[i];
+        if (a.end <= h.start) break;        // 不重叠；更早接受的区间也不可能重叠
+        const hl = h.end - h.start, al = a.end - a.start;
+        if (hl > al || (hl === al && h.pri > a.pri)) {
+          accepted.splice(i, 1);           // 当前更长（或等长更优）→ 替换短匹配
+        } else {
+          return;                          // 当前不够长 → 丢弃，长匹配保留
+        }
+      }
+      accepted.push(h);                    // 与已接受区间不重叠 → 直接接受
     });
 
-    /* 汇总语法点（按出现次数降序） */
+    /* 汇总语法点（按出现次数降序）；同一身份键只出一个点，有卡片时以卡片为代表 */
     const pmap = {};
     accepted.forEach(function (h) {
-      const name = h.card ? h.card.name : h.extra.name;
-      if (!pmap[name]) {
-        pmap[name] = {
-          name: name, card: h.card, extra: h.extra,
+      let p = pmap[h.key];
+      if (!p) {
+        p = pmap[h.key] = {
+          name: h.card ? h.card.name : h.extra.name,
+          card: h.card, extra: h.extra,
           isNew: !h.card, count: 0, surfaces: []
         };
+      } else if (!p.card && h.card) {
+        p.card = h.card;
+        p.name = h.card.name;
+        p.isNew = false;
       }
-      pmap[name].count++;
-      if (pmap[name].surfaces.indexOf(h.surface) === -1) pmap[name].surfaces.push(h.surface);
+      p.count++;
+      if (p.surfaces.indexOf(h.surface) === -1) p.surfaces.push(h.surface);
     });
     const points = Object.keys(pmap).map(function (k) { return pmap[k]; })
       .sort(function (a, b) { return b.count - a.count || (a.name < b.name ? -1 : 1); });
@@ -286,14 +486,25 @@
     const arts = Store.getArticles();
 
     const listHTML = arts.length ? arts.map(function (a) {
+      /* 语法点数随卡片库增长而变化：每次打开列表都用当前题库重新识别一次，
+         卡片导入得越多，识别越全；并把最新结果回写到文章记录 */
+      const live = analyze(a.text);
+      const pointCount = live.points.length;
+      const newCount = live.points.filter(function (p) { return p.isNew; }).length;
+      if (pointCount !== a.pointCount || newCount !== a.newCount) {
+        a.pointCount = pointCount;
+        a.newCount = newCount;
+        a.difficulty = assessDifficulty(a.text, live.points);
+        Store.updateArticle(a);
+      }
       return '<div class="art-item" data-art="open" data-id="' + a.id + '">' +
         '<div class="ai-main">' +
         '<div class="ai-title">' + B.esc(a.title) + '</div>' +
         '<div class="ai-meta">' +
         '<span>' + fmtDate(a.createdAt) + '</span>' +
         '<span class="badge ' + DIFF_BADGE[a.difficulty] + '">' + B.esc(a.difficulty) + '</span>' +
-        '<span class="badge todo">' + a.pointCount + ' 个语法点</span>' +
-        (a.newCount ? '<span class="badge new-pt">新 ' + a.newCount + '</span>' : '') +
+        '<span class="badge todo">' + pointCount + ' 个语法点</span>' +
+        (newCount ? '<span class="badge new-pt">新 ' + newCount + '</span>' : '') +
         (a.questionIds && a.questionIds.length
           ? '<span class="badge done">练习 ' + a.questionIds.length + ' 题</span>' : '') +
         '</div></div>' +
@@ -320,7 +531,7 @@
     closePop();
     const B = window.AppBridge;
     B.setHTML(
-      '<a class="back-link" href="#/articles">‹ 返回文章列表</a>' +
+      '<a class="back-link" href="#/articles">‹ 返回</a>' +
       '<header class="page-head"><h1>导入文章</h1>' +
       '<div class="sub">粘贴一段日语文章，系统自动识别其中的语法点</div></header>' +
       '<div class="import-card">' +
@@ -365,7 +576,7 @@
     if (!a) {
       B.setHTML('<div class="empty"><span class="e-ico">🔍</span>' +
         '<div class="e-txt">文章不存在或已删除</div>' +
-        '<a class="btn btn-primary" href="#/articles">返回文章列表</a></div>');
+        '<a class="btn btn-primary back-link" href="#/articles">‹ 返回</a></div>');
       return;
     }
     if (!current || !current.article || current.article.id !== id) {
@@ -401,6 +612,7 @@
               return '<div class="example-item"><div class="ex-jp">' + B.esc(ex.jp) +
                 '</div><div class="ex-cn">' + B.esc(ex.cn) + '</div></div>';
             }).join('') : '') +
+          multiSourceHTML(B, c) +
           '<a class="pt-link" href="#/card/' + encodeURIComponent(c.name) + '">查看完整卡片 ›</a>';
       } else {
         body =
@@ -449,7 +661,7 @@
     const newCount = analysis.points.filter(function (p) { return p.isNew; }).length;
 
     B.setHTML(
-      '<a class="back-link" href="#/articles">‹ 返回文章列表</a>' +
+      '<a class="back-link" href="#/articles">‹ 返回</a>' +
       '<header class="page-head"><h1>文章精读</h1>' +
       '<div class="art-meta-row">' +
       '<span class="badge ' + DIFF_BADGE[a.difficulty] + '">' + B.esc(a.difficulty) + '难度</span>' +
@@ -567,6 +779,38 @@
     if (popEl) { popEl.remove(); popEl = null; }
   }
 
+  /** 来源（书·章节）显示名 */
+  function scopeLabel(bookId, chapterId) {
+    if (!bookId) return '未分类';
+    const book = Store.getBookById(bookId);
+    let t = book ? book.name : '未知书籍';
+    if (chapterId && book && Array.isArray(book.chapters)) {
+      const ch = book.chapters.find(c => c.id === chapterId);
+      if (ch) t += ' · ' + ch.name;
+    }
+    return t;
+  }
+
+  /**
+   * 多来源摘要块：一个主考点挂了多个来源（书）时，
+   * 列出各来源书名 + 摘要首句（最多3条），精读只按主考点匹配一次。
+   */
+  function multiSourceHTML(B, card) {
+    const srcs = (card.sources && card.sources.length)
+      ? card.sources
+      : [{ bookId: card.bookId || '', chapterId: card.chapterId || '', summary: card.summary || '' }];
+    if (srcs.length <= 1) return '';
+    const rows = srcs.slice(0, 3).map(function (s) {
+      const first = (s.summary || '').split(/[。．.\n]/)[0].slice(0, 40);
+      return '<div class="ms-src-row">📖《' + B.esc(scopeLabel(s.bookId, s.chapterId)) + '》：' +
+        B.esc(first || '（无摘要）') + '</div>';
+    }).join('');
+    const more = srcs.length > 3
+      ? '<div class="ms-src-more">其余 ' + (srcs.length - 3) + ' 个来源见完整卡片</div>' : '';
+    return '<div class="ms-src-box"><div class="ms-src-tip">📚 这个语法点有 ' +
+      srcs.length + ' 个来源讲解（各书讲解独立保留，不合并）</div>' + rows + more + '</div>';
+  }
+
   function showPop(idx, x, y) {
     closePop();
     if (!current) return;
@@ -581,6 +825,7 @@
         '<div class="hp-name">' + B.esc(h.card.name) + '</div>' +
         '<div class="hp-cat">' + B.esc(h.card.category) + '</div>' +
         '<div class="hp-sum">' + B.esc(h.card.summary || '暂无摘要') + '</div>' +
+        multiSourceHTML(B, h.card) +
         '<a class="hp-link" href="#/card/' + encodeURIComponent(h.card.name) + '">查看完整卡片 ›</a>';
     } else {
       popEl.innerHTML =
@@ -625,7 +870,7 @@
     const B = window.AppBridge;
     const extra = EXTRA_GRAMMAR.filter(function (x) { return x.name === name; })[0];
     if (!extra) return;
-    const r = Store.upsertCards([{
+    const r = Store.importCards([{
       id: Store.uid('c'),
       name: extra.name,
       category: '文章精读·新语法',
@@ -697,6 +942,8 @@
   window.ArticlePage = {
     renderList: renderList,
     renderNew: renderNew,
-    renderDetail: renderDetail
+    renderDetail: renderDetail,
+    analyze: analyze,
+    assessDifficulty: assessDifficulty
   };
 })();
