@@ -48,6 +48,44 @@
     }[c]));
   }
 
+  /* ---------- 语法卡片模糊搜索（所有卡片列表共用同一套规则） ----------
+   * ① 归一化：去 ～/空格/括号标点并转小写，所以「ている」能匹配「～ている」；
+   * ② 连续子串命中；
+   * ③ 非连续拆字命中（如「てい」→「～ている」、「上げ」→「～上で」类缩写场景）。
+   */
+  function normSearch(s) {
+    return String(s == null ? '' : s)
+      .replace(/[〜～\s　()（）\[\]［］【】「」『』、，。．\/・]/g, '')
+      .toLowerCase();
+  }
+  function fuzzyHit(query, haystack) {
+    const q = normSearch(query);
+    if (!q) return true;
+    const h = normSearch(haystack);
+    if (!h) return false;
+    if (h.indexOf(q) !== -1) return true;
+    let i = 0;
+    for (let j = 0; j < h.length; j++) {
+      if (h[j] === q[i]) { if (++i === q.length) return true; }
+    }
+    return false;
+  }
+  /** 卡片可检索文本：名称 / 门类 / 摘要 / 子考点用法名 */
+  function cardSearchText(c) {
+    const subs = Array.isArray(c.subPoints)
+      ? c.subPoints.map(sp => sp && sp.title || '').join(' ') : '';
+    return [c.name, c.category, c.summary, subs].join(' ');
+  }
+  /** 统一搜索框 HTML；placeholder 可按页面定制 */
+  function searchBarHTML(placeholder) {
+    return '<div class="search-bar">' +
+      '<span class="sb-ico">🔍</span>' +
+      '<input class="card-search-input" type="search" enterkeyhint="search" ' +
+      'placeholder="' + esc(placeholder || '搜索语法') + '" autocomplete="off">' +
+      '<button class="search-clear" type="button" data-action="search-clear" ' +
+      'hidden aria-label="清除">✕</button></div>';
+  }
+
   function shuffle(arr) {
     const a = arr.slice();
     for (let i = a.length - 1; i > 0; i--) {
@@ -200,7 +238,15 @@
     try { localStorage.setItem('jp_learn_mode', mode); } catch (e) { }
   }
 
-  function startSession(mode, title, qs, pointName, articleId, sourceBookId) {
+  /** 综合练习各入口的进度键：同一范围的答题进度存为同一份草稿 */
+  const PK = {
+    MIXED: 'mixed',                              // 随机练习全部
+    UNCAT: 'uncat',                              // 未分类题目
+    book: id => 'book:' + (id || ''),            // 练整本
+    ch: (bookId, chapterId) => 'ch:' + (bookId || '') + ':' + (chapterId || '')
+  };
+
+  function startSession(mode, title, qs, pointName, articleId, sourceBookId, draftKey) {
     if (!qs.length) {
       toast(mode === 'marked' ? '疑难队列是空的' : '没有可用的题目');
       return;
@@ -214,10 +260,120 @@
       learnMode: getLearnMode(), // learn（随时查选项卡） | train（作答后才能查）
       finished: false,
       reviewing: false,
-      qStart: Date.now()
+      qStart: Date.now(),
+      draftKey: draftKey || ''   // 综合练习会话才有：进度按此键落盘，可断点续练
     };
+    if (session.draftKey) persistSession();
     if (location.hash !== '#/quiz') location.hash = '#/quiz';
     else renderQuiz();
+  }
+
+  /** 把当前综合练习会话写入 localStorage（仅带 draftKey 的会话） */
+  function persistSession() {
+    if (!session || !session.draftKey) return;
+    if (session.finished) {
+      Store.deletePracticeDraft(session.draftKey);
+      Store.clearActivePracticeKey(session.draftKey);
+      return;
+    }
+    const s = session;
+    Store.savePracticeDraft(s.draftKey, {
+      key: s.draftKey,
+      mode: s.mode,
+      title: s.title,
+      pointName: s.pointName || '',
+      articleId: s.articleId || '',
+      sourceBookId: s.sourceBookId || '',
+      bookId: s.bookId || '',
+      chapterId: s.chapterId || '',
+      feedback: s.feedback,
+      learnMode: s.learnMode,
+      index: s.index,
+      updatedAt: Date.now(),
+      items: s.items.map(it => ({
+        qid: it.q.id,
+        perm: it.perm.slice(),
+        chosen: it.chosen,
+        ms: it.ms,
+        uncertain: !!it.uncertain
+      }))
+    });
+    Store.setActivePracticeKey(s.draftKey);
+  }
+
+  /**
+   * 从 localStorage 恢复一份综合练习会话。
+   * 已删除的题目自动剔除；题目删光时清掉草稿并返回 false。
+   */
+  function restoreSession(key) {
+    const d = Store.getPracticeDraft(key);
+    if (!d) return false;
+    const qMap = new Map(Store.getQuestions().map(q => [q.id, q]));
+    const items = [];
+    (Array.isArray(d.items) ? d.items : []).forEach(raw => {
+      const q = qMap.get(raw.qid);
+      if (!q) return;
+      const permOK = Array.isArray(raw.perm) && raw.perm.length === 4 &&
+        raw.perm.every(k => 'ABCD'.indexOf(k) > -1) && new Set(raw.perm).size === 4;
+      const perm = permOK ? raw.perm.slice() : shuffle(['A', 'B', 'C', 'D']);
+      const displayAnswer = perm.indexOf(q.answer);
+      const chosen = [0, 1, 2, 3].indexOf(raw.chosen) > -1 ? raw.chosen : null;
+      items.push({
+        q, perm, displayAnswer, chosen,
+        correct: chosen === null ? false : chosen === displayAnswer,
+        ms: chosen === null ? null : (raw.ms || null),
+        uncertain: !!raw.uncertain
+      });
+    });
+    if (!items.length) {
+      Store.deletePracticeDraft(key);
+      Store.clearActivePracticeKey(key);
+      return false;
+    }
+    /* 定位到第一道未答题；都答完了就停在最后一题（点「查看结果」交卷） */
+    let index = Math.min(Math.max(0, (d.index | 0) || 0), items.length - 1);
+    const firstUnanswered = items.findIndex(it => it.chosen === null);
+    if (firstUnanswered > -1 && items[index].chosen !== null) index = firstUnanswered;
+    session = {
+      mode: d.mode || 'mixed',
+      title: d.title || '综合练习',
+      pointName: d.pointName || '',
+      articleId: d.articleId || '',
+      sourceBookId: d.sourceBookId || '',
+      bookId: d.bookId || '',
+      chapterId: d.chapterId || '',
+      items, index,
+      feedback: d.feedback === 'exam' ? 'exam' : 'instant',
+      learnMode: d.learnMode === 'train' ? 'train' : getLearnMode(),
+      finished: false,
+      reviewing: false,
+      qStart: Date.now(),
+      draftKey: key
+    };
+    Store.setActivePracticeKey(key);
+    return true;
+  }
+
+  /**
+   * 综合练习统一入口：内存中的同一练习优先 → 已存进度直接续练 → 否则全新开始。
+   * 只有已经答过题（至少 1 题）的草稿才续练，0 题草稿按重开处理。
+   */
+  function resumeOrStart(key, starter) {
+    if (session && !session.finished && session.draftKey === key) {
+      if (location.hash !== '#/quiz') location.hash = '#/quiz';
+      else renderQuiz();
+      return;
+    }
+    Store.prunePracticeDrafts();
+    const d = Store.getPracticeDraft(key);
+    const hasAnswers = d && Array.isArray(d.items) &&
+      d.items.some(it => it.chosen !== null);
+    if (hasAnswers && restoreSession(key)) {
+      if (location.hash !== '#/quiz') location.hash = '#/quiz';
+      else renderQuiz();
+      return;
+    }
+    starter();
   }
 
   /**
@@ -230,12 +386,17 @@
     return list.filter(q => (q.bookId || '') === bookId);
   }
 
-  function startPoint(name, bookId) {
-    const all = Store.getQuestions().filter(q => q.point === name);
+  function startPoint(name, bookId, subPoint) {
+    let all = Store.getQuestions().filter(q => q.point === name);
+    /* 专练某个用法（子考点）：只取该用法下的题目 */
+    if (subPoint) all = all.filter(q => (q.subPoint || '') === subPoint);
     const qs = filterBySource(all, bookId);
     const label = sourceFilterLabel(bookId);
-    startSession('point', label ? name + '（' + label + '）' : name,
-      qs, name, '', bookId || '');
+    let title = name;
+    if (subPoint) title += '·' + subPoint;
+    if (label) title += '（' + label + '）';
+    startSession('point', title, qs, name, '', bookId || '');
+    if (session) session.subPoint = subPoint || '';
   }
 
   /** 综合练习随机：只练已归入语法练习书章节的题目（不碰未分类题） */
@@ -246,7 +407,14 @@
       location.hash = '#/import';
       return;
     }
-    startSession('mixed', '综合练习 · 随机', qs);
+    startSession('mixed', '综合练习 · 随机', qs, '', '', '', PK.MIXED);
+  }
+
+  /** 综合练习：未分类题目随机练 */
+  function startUncatPractice() {
+    const qs = Store.getQuestions().filter(q => !q.reading && !q.bookId);
+    if (!qs.length) { toast('没有未分类题目'); return; }
+    startSession('mixed', '未分类题目 · 随机', qs, '', '', '', PK.UNCAT);
   }
 
   function startWrongPractice(bookId) {
@@ -279,16 +447,22 @@
 
   function restartSession() {
     if (!session) return location.hash = '#/home';
+    /* 综合练习会话按进度键判定原范围（未分类 / 练整本 / 章节各不相同） */
+    const key = session.draftKey || '';
+    if (key === PK.MIXED) return startMixed();
+    if (key === PK.UNCAT) return startUncatPractice();
+    if (key.indexOf('book:') === 0) return startBookPractice(session.bookId || key.slice(5));
+    if (key.indexOf('ch:') === 0) {
+      return startChapter(session.bookId || '', session.chapterId || '');
+    }
     const src = session.sourceBookId || '';
     ({
       point: () => startPoint(session.pointName, src),
-      mixed: startMixed,
       wrong: () => startWrongPractice(src),
       marked: () => startMarkedPractice(src),
       similar: () => startSimilar(session.pointName, ''),
       article: () => startSession('article', session.title,
-        session.items.map(it => it.q), '', session.articleId),
-      chapter: () => startChapter(session.bookId || '', session.chapterId || '')
+        session.items.map(it => it.q), '', session.articleId)
     })[session.mode]();
   }
 
@@ -312,6 +486,7 @@
       if (s.mode === 'wrong') Store.removeWrong(qid);
       if (s.mode === 'marked' && !it.uncertain) Store.removeMarked(qid);
     }
+    persistSession();
     renderQuiz();
   }
 
@@ -320,6 +495,7 @@
     const it = session.items[session.index];
     if (it.chosen !== null) return;
     it.uncertain = !it.uncertain;
+    persistSession();
     renderQuiz();
   }
 
@@ -330,6 +506,7 @@
       return;
     }
     session.feedback = mode;
+    persistSession();
     renderQuiz();
   }
 
@@ -338,6 +515,7 @@
     if (session.index < session.items.length - 1) {
       session.index++;
       session.qStart = Date.now();
+      persistSession();
       renderQuiz();
     } else {
       finishSession();
@@ -347,6 +525,8 @@
   function finishSession() {
     const s = session;
     s.finished = true;
+    /* 综合练习：整套答完，清除断点续练进度 */
+    persistSession();
     // 汇总并落盘
     const agg = {};
     s.items.forEach(it => {
@@ -399,7 +579,8 @@
     const listHTML = cards.length ? cards.map(c => {
       const done = !!completed[c.name];
       const qc = allQuestions.filter(q => q.point === c.name).length;
-      return '<a class="point-card" href="#/card/' + encodeURIComponent(c.name) + '">' +
+      return '<a class="point-card" href="#/card/' + encodeURIComponent(c.name) +
+        '" data-csearch="' + esc(cardSearchText(c)) + '">' +
         '<div class="pc-top">' +
         '<span class="pc-name">' + esc(c.name) + '</span>' +
         '<span class="badge ' + (done ? 'done' : 'todo') + '">' +
@@ -464,7 +645,12 @@
       weakPanelHTML() +
 
       '<div class="section-title">考点列表 <span class="count">按复习优先级排序</span></div>' +
-      listHTML
+      (cards.length
+        ? '<div class="search-zone">' +
+        searchBarHTML('搜索语法：名称 / 门类 / 摘要 / 用法') +
+        '<div class="search-rows">' + listHTML + '</div>' +
+        '<div class="search-empty" hidden>🔍 没有匹配的语法卡片</div></div>'
+        : listHTML)
     );
   }
 
@@ -474,6 +660,9 @@
   let currentCardName = '';
   /** 卡片详情页当前选中的来源筛选（'' 全部 / 'none' 未分类 / 书 id） */
   let cardSourceFilter = '';
+  /** 卡片详情页当前选中的子考点用法（'' = 全部/总纲）；cardSubFilterCard 记录归属卡片名 */
+  let cardSubFilter = '';
+  let cardSubFilterCard = '';
   /** 新增题目弹窗状态：tab = manual | paste；text 为粘贴原文；parsed 为解析结果 */
   const addQState = { tab: 'manual', text: '', parsed: [] };
 
@@ -498,6 +687,14 @@
         emphasis: card.emphasis || '', examples: card.examples || []
       }];
 
+    /* 切换卡片时重置用法标签；当前用法被删时回退「全部」 */
+    if (cardSubFilterCard !== name) { cardSubFilter = ''; cardSubFilterCard = name; }
+    const subPoints = Array.isArray(card.subPoints) ? card.subPoints : [];
+    if (cardSubFilter && !subPoints.some(sp => sp.title === cardSubFilter)) cardSubFilter = '';
+    const activeSub = cardSubFilter
+      ? (subPoints.find(sp => sp.title === cardSubFilter) || null)
+      : null;
+
     /* 当前来源筛选已不可用（题目被删/移走）时回退全部 */
     const allQuestions = Store.getQuestions().filter(q => q.point === name);
     const validTokens = [''];
@@ -506,7 +703,8 @@
       if (validTokens.indexOf(t) === -1) validTokens.push(t);
     });
     if (validTokens.indexOf(cardSourceFilter) === -1) cardSourceFilter = '';
-    const questions = filterBySource(allQuestions, cardSourceFilter);
+    let questions = filterBySource(allQuestions, cardSourceFilter);
+    if (activeSub) questions = questions.filter(q => (q.subPoint || '') === cardSubFilter);
     const qCount = questions.length;
     const done = Store.isCompleted(name);
 
@@ -517,24 +715,48 @@
         scopeToRoute(sc.chapterId || '') + '">🗂 ' + esc(scopeText(sc.bookId, sc.chapterId)) + '</a>';
     }).join('');
 
-    /* 多来源折叠段 */
+    /* 多来源折叠段（总纲视图） */
     const sourcesHTML = sources.map((s, i) => cardSourceSectionHTML(s, i, sources.length)).join('');
+
+    /* 子考点用法详情段（某个用法标签被选中时替代来源段） */
+    const subDetailHTML = activeSub ? subPointSectionHTML(activeSub) : '';
+
+    /* 横向滑动的用法标签栏：全部 / 各用法（附题数） */
+    const subTabBtn = (title, label, n, isActive) =>
+      '<button class="sub-tab' + (isActive ? ' active' : '') +
+      '" data-action="card-sub" data-sub="' + esc(title) + '">' +
+      esc(label) + '<em>' + n + '</em></button>';
+    const subTabsHTML = subPoints.length
+      ? '<div class="sub-tabs">' +
+      subTabBtn('', '全部', allQuestions.length, !activeSub) +
+      subPoints.map(sp => subTabBtn(sp.title, sp.title,
+        allQuestions.filter(q => (q.subPoint || '') === sp.title).length,
+        activeSub && activeSub.title === sp.title)).join('') +
+      '</div>'
+      : '';
 
     /* 来源筛选 + 刷题 */
     const pillsHTML = sourcePillsHTML(allQuestions, 'card-src', cardSourceFilter,
       ' data-name="' + esc(name) + '"');
     const filterLabel = sourceFilterLabel(cardSourceFilter);
     const startBtnLabel = qCount
-      ? '开始刷题（' + qCount + '题' + (filterLabel ? ' · ' + filterLabel : '') + '）'
+      ? (activeSub ? '专练「' + activeSub.title + '」（' : '练整张卡片（') + qCount + '题' +
+      (filterLabel ? ' · ' + filterLabel : '') + '）'
       : '暂无题目';
 
+    const listTitle = activeSub
+      ? '用法「' + activeSub.title + '」的题目'
+      : '题目列表';
     const qListHTML = qCount
-      ? '<div class="section-title">题目列表 <span class="count">共 ' + qCount +
+      ? '<div class="section-title">' + esc(listTitle) + ' <span class="count">共 ' + qCount +
       ' 题 · 点击题目可展开详情</span></div>' +
       questions.map(cardQuestionItemHTML).join('')
       : '<div class="empty"><span class="e-ico">📝</span>' +
-      '<div class="e-txt">这个考点' + (filterLabel ? '在「' + filterLabel + '」中' : '下') +
-      '还没有题目，点底部按钮新增</div></div>';
+      '<div class="e-txt">' + (activeSub
+        ? '用法「' + esc(activeSub.title) + '」下还没有题目，点底部按钮新增'
+        : '这个考点' + (filterLabel ? '在「' + filterLabel + '」中' : '下') +
+        '还没有题目，点底部按钮新增') +
+      '</div></div>';
 
     setHTML(
       '<a class="back-link" href="#/home">‹ 返回</a>' +
@@ -551,11 +773,15 @@
       '<span class="badge ' + (done ? 'done' : 'todo') + '">' +
       (done ? '✓ 已完成' : '未完成') + '</span>' +
       '<span class="badge todo">' + allQuestions.length + ' 题</span>' +
+      (subPoints.length
+        ? '<span class="badge sub-count">🔖 ' + subPoints.length + ' 个用法</span>'
+        : '') +
       '<span class="badge src-count">📚 ' + sources.length + ' 个来源</span>' +
       dueBadgeOf(card) +
       '</div>' +
       '<div class="dc-scopes">' + scopeHTML + '</div>' +
-      sourcesHTML +
+      subTabsHTML +
+      (activeSub ? subDetailHTML : sourcesHTML) +
       '</div>' +
       pillsHTML +
       '<button class="btn btn-primary" data-action="card-start"' +
@@ -566,6 +792,26 @@
       '<button class="btn btn-ghost" data-action="batch-open">批量管理</button>' +
       '</div>'
     );
+  }
+
+  /** 卡片详情页：单个子考点（用法）的讲解/例句段 */
+  function subPointSectionHTML(sp) {
+    const examplesHTML = (sp.examples && sp.examples.length)
+      ? sp.examples.map(ex =>
+        '<div class="example-item"><div class="ex-jp">' + esc(ex.jp) +
+        '</div><div class="ex-cn">' + esc(ex.cn) + '</div></div>').join('')
+      : '';
+    return '<div class="sub-detail">' +
+      '<div class="detail-block"><div class="db-title">📖 讲解 · ' + esc(sp.title) + '</div>' +
+      '<div class="db-body">' + (esc(sp.lecture) || '<span class="db-empty">（暂无讲解）</span>') +
+      '</div></div>' +
+      (examplesHTML
+        ? '<div class="detail-block"><div class="db-title">💬 例句</div>' + examplesHTML + '</div>'
+        : '') +
+      (sp.emphasis
+        ? '<div class="detail-block"><div class="db-title">🎯 侧重点</div>' +
+        '<div class="db-body">' + esc(sp.emphasis) + '</div></div>'
+        : '') + '</div>';
   }
 
   /** 卡片详情页中的单个来源折叠段 */
@@ -623,6 +869,7 @@
       '<span class="badge diff-' + (q.difficulty || '中') + '">' + esc(q.difficulty || '中') + '</span>' +
       '<span class="badge cat">' + esc(q.type || '单选题') + '</span>' +
       '<span class="badge todo cq-cat">' + esc(q.category || '') + '</span>' +
+      (q.subPoint ? '<span class="badge sub-badge">🔖 ' + esc(q.subPoint) + '</span>' : '') +
       sourceBadgeHTML(q.bookId, q.chapterId) +
       '</div>' +
       '<div class="cq-stem">' + esc(q.stem) + '</div>' +
@@ -903,8 +1150,21 @@
       esc(q.point || '') + '" placeholder="考点名称">' + pointDatalistHTML('pointList');
     const opts = (sel, vals) => vals.map(v =>
       '<option value="' + v + '"' + (v === sel ? ' selected' : '') + '>' + v + '</option>').join('');
+    /* 用法（子考点）下拉：选项来自该考点卡片的子考点列表 */
+    const subCard = Store.getCardByName(q.point || currentCardName);
+    const subTitles = subCard && Array.isArray(subCard.subPoints)
+      ? subCard.subPoints.map(sp => sp.title)
+      : [];
+    const subField = subTitles.length
+      ? '<div class="fld"><label>用法（子考点，不区分可留空）</label>' +
+      '<select id="qf-sub"><option value="">（不区分用法）</option>' +
+      subTitles.map(t => '<option value="' + esc(t) + '"' +
+      (t === (q.subPoint || '') ? ' selected' : '') + '>' + esc(t) + '</option>').join('') +
+      '</select></div>'
+      : '';
     return '<div class="fld"><label>考点名称</label>' + pointField + '</div>' +
       sourcePickerHTML('qf-book', 'qf-chapter', q.bookId || '', q.chapterId || '') +
+      subField +
       '<div class="fld-row">' +
       '<div class="fld"><label>门类</label><input id="qf-category" type="text" value="' +
       esc(q.category || '') + '"></div>' +
@@ -928,12 +1188,14 @@
   function readQuestionForm() {
     const bookSel = modalEl && modalEl.querySelector('#qf-book');
     const chSel = modalEl && modalEl.querySelector('#qf-chapter');
+    const subSel = modalEl && modalEl.querySelector('#qf-sub');
     return {
       point: modalVal('qf-point').trim(),
       category: modalVal('qf-category').trim() || '自定义',
       type: modalVal('qf-type').trim() || '单选题',
       difficulty: modalVal('qf-difficulty'),
       answer: modalVal('qf-answer'),
+      subPoint: subSel ? subSel.value : '',
       bookId: bookSel ? bookSel.value : '',
       chapterId: chSel ? chSel.value : '',
       stem: modalVal('qf-stem').trim(),
@@ -1048,6 +1310,7 @@
       const base = {
         point: currentCardName, category: card ? (card.category || '') : '',
         type: '单选题', difficulty: '中', answer: 'A', options: {},
+        subPoint: cardSubFilter || '',
         bookId: card ? (card.bookId || '') : '',
         chapterId: card ? (card.chapterId || '') : ''
       };
@@ -1262,7 +1525,18 @@
   /* ================= 视图：刷题 ================= */
 
   function renderQuiz() {
-    if (!session) { location.hash = '#/home'; return; }
+    if (!session) {
+      /* 刷新/重开页面停在刷题页：尝试恢复最近一次综合练习的断点进度 */
+      const activeKey = Store.getActivePracticeKey();
+      if (activeKey) {
+        Store.prunePracticeDrafts();
+        if (Store.getPracticeDraft(activeKey) && restoreSession(activeKey)) {
+          return renderQuiz();
+        }
+      }
+      location.hash = '#/home';
+      return;
+    }
     if (session.finished) {
       if (session.reviewing) return renderReviewQuestion();
       return renderFinish();
@@ -1294,9 +1568,9 @@
       const peekLocked = s.learnMode !== 'learn' && !answered;
       const cardIco = cardName
         ? '<span class="opt-card' + (peekLocked ? ' locked' : '') + '"' +
-          ' data-action="quiz-opt-card" data-orig="' + origKey + '" title="' +
-          (peekLocked ? '训练模式：作答后才能查看该语法点卡片' : '查看该选项对应的语法点卡片') +
-          '">' + (peekLocked ? '🔒' : '📇') + '</span>'
+        ' data-action="quiz-opt-card" data-orig="' + origKey + '" title="' +
+        (peekLocked ? '训练模式：作答后才能查看该语法点卡片' : '查看该选项对应的语法点卡片') +
+        '">' + (peekLocked ? '🔒' : '📇') + '</span>'
         : '';
       return '<button class="' + cls + '" data-action="quiz-option"' +
         (answered ? '' : ' data-idx="' + i + '"') + '>' +
@@ -1408,7 +1682,7 @@
       const cardName = ((q.optionCards && q.optionCards[origKey]) || '').trim();
       const cardIco = cardName
         ? '<span class="opt-card" data-action="quiz-opt-card" data-orig="' + origKey +
-          '" title="查看该选项对应的语法点卡片">📇</span>' : '';
+        '" title="查看该选项对应的语法点卡片">📇</span>' : '';
       return '<div class="' + cls + '">' +
         '<span class="opt-key">' + String.fromCharCode(65 + i) + '</span>' +
         '<span class="opt-text">' + esc(q.options[origKey]) + '</span>' + cardIco + '</div>';
@@ -1644,7 +1918,13 @@
     '【侧重点】N4 侧重结果状态用法，注意与～てある的区别。\n' +
     '【例句】父は今、新聞を読んでいます。/ 爸爸正在看报纸。\n' +
     '【例句】田中さんは東京に住んでいます。/ 田中先生住在东京。\n' +
-    '同名卡片不会覆盖：不同书各写一份讲解，导入后作为独立来源分别保留。';
+    '同名卡片不会覆盖：不同书各写一份讲解，导入后作为独立来源分别保留。\n\n' +
+    '📎 一个语法有多个用法时用【子考点】拆成多个标签页（卡片内左右滑动切换），' +
+    '子考点下可直接内嵌题目，题目会随卡片一起导入：\n' +
+    '【考点名称】は\n【门类】格助词\n【摘要】は的核心用法\n【讲解】总纲…\n' +
+    '【子考点】提示主题\n【讲解】は提示句子的主题…\n【例句】私は学生です。/ 我是学生。\n' +
+    '【题目】（题干）\n【选项A】は\n【选项B】が\n【选项C】を\n【选项D】に\n【答案】A\n【解析】…\n' +
+    '【子考点】对比\n【讲解】は表示对比…\n【题目】（题干）\n【选项A】…（A-D 四个）\n【答案】B';
 
   /** 给 AI 的题目生成模板；已选好书籍+章节时把归属两行带进每道题的格式 */
   function questionPromptText() {
@@ -1654,9 +1934,9 @@
       ? (book.chapters || []).find(c => c.id === importState.chapterId) : null;
     const scopeHead = book && chapter
       ? '每道题的开头必须原样照抄下面两行归属字段（一字不改），确保生成的题目自动归入该书该章：\n' +
-        '【书籍】' + book.name + '\n【章节】' + chapter.name + '\n\n'
+      '【书籍】' + book.name + '\n【章节】' + chapter.name + '\n\n'
       : '';
-    return '请按以下格式生成日语语法单选题，每道题之间用一个空行分隔，' +
+    return '我已经有日语语法单选题，按照以下格式给我转换，每道题之间用一个空行分隔，' +
       '每行一个字段，字段名必须用【】包裹，不要输出格式以外的内容：\n\n' +
       scopeHead +
       '【门类】（如 N5文法 / N4文法 / N3文法/ N2文法/ N1文法）\n' +
@@ -1670,11 +1950,7 @@
       '【答案】（只能是 A / B / C / D 中的一个字母）\n' +
       '【解析】（中文，解析需要详细，说明正确选项为什么对、其他选项为什么不合适,① 正确选项的语法含义和接续方式）,② 正确选项在句中的具体作用（为什么符合句意）,③ 逐一说明其他三个选项为什么不适合（各自含义、接续、语境差异）,④ 如果涉及近义语法，要补充对比辨析,⑤ 必要时给出一个额外的正确例句\n' +
       '【难度】（易 / 中 / 难）\n\n' +
-      '要求：四个选项必须有迷惑性、考察同一语法点；题干自然地道、符合日语语法；\n' +
-      '四个选项本身尽量都是语法点形式，并在【选项X卡片】里写出它对应的语法点全名' +
-      '（带～和括号，如选项写「あげく」、卡片写「～あげく（に）」），' +
-      '用户点选项即可查看该语法点卡片；纯词形变化等没有对应卡片的选项，该行省略即可；\n' +
-      '一次生成 100 道题，考点不要重复。';
+      '要求：考点语法和选项语法点只能是我对应的语法点卡片，不能是其他语法点的卡片。如果考点名称没有则整行省略。';
   }
 
   /** 给 AI 的卡片生成提示词（一键复制用） */
@@ -1688,10 +1964,21 @@
     '【讲解】（接续方式 + 主要用法 + 注意事项，可写多条）\n' +
     '【侧重点】（可选：这本书特别强调、或与其他级别/教材不同的重点）\n' +
     '【例句】（日语句子 / 中文翻译，可写多条，每条单独一行【例句】）\n\n' +
+    '如果一个语法点有多个不同用法（如 は＝主题/对比/强调），在上述总纲字段之后，' +
+    '为每个用法各写一组（顺序：先写完全部总纲字段，再依次写各用法）：\n' +
+    '【子考点】（用法名称，如 提示主题 / 对比 / 强调，简短的名词短语）\n' +
+    '【讲解】（该用法的接续与语义）\n' +
+    '【侧重点】（可选）\n' +
+    '【例句】（该用法的例句，可多条）\n' +
+    '需要配题时紧接该用法写：【题目】题干、【选项A】…【选项B】…【选项C】…【选项D】…、' +
+    '【答案】A-D 单字母、【解析】中文解析、【难度】易/中/难；' +
+    '同一用法可连续写多道【题目】，题目自动归入该用法，用于卡片内「专练此用法」。\n\n' +
     '要求：考点名称必须带～接续符号（决定能否被文章精读识别）；' +
-    '摘要简洁；讲解讲清接续和用法区别；例句地道且带翻译。\n' +
-    '同一语法点在不同书里讲解可以不一样：同名卡片会作为不同来源各自保留，不会覆盖。\n' +
-    '一次生成 20 张卡片，考点之间不要重复。';
+    '摘要简洁；讲解讲清接续和用法区别；例句地道且带翻译；' +
+    '子考点只在确实存在多个用法时使用，单一用法不要硬拆。\n' +
+    '同一语法点在不同书里讲解可以不一样：同名卡片会作为不同来源各自保留，不会覆盖；' +
+    '子考点按用法名称合并（同名称更新、新名称追加）。\n' +
+    '';
 
   /* ---------- 导入归属：书籍 / 章节选择 ---------- */
 
@@ -2060,6 +2347,13 @@
         const d = p.data;
         /* 判断是否已有同名卡片（将被更新而非新增） */
         const exists = d.name && Store.getCards().some(c => c.name === d.name);
+        const subs = Array.isArray(d.subPoints) ? d.subPoints : [];
+        const embN = Array.isArray(d.questions) ? d.questions.length : 0;
+        const subLine = subs.length
+          ? '<div class="pi-opt">子考点 ' + subs.length + ' 个：' +
+          esc(subs.map(sp => sp.title + (sp.questions && sp.questions.length ? '(' + sp.questions.length + '题)' : '')).join(' / ')) +
+          '</div>'
+          : '';
         return '<div class="preview-item' + (p.valid ? '' : ' invalid') + '">' +
           '<div class="pi-title">第' + p.index + '块 · ' + esc(d.name || '(无名称)') +
           (p.valid
@@ -2071,6 +2365,8 @@
           '<div class="pi-line">摘要：' + esc(d.summary) + '</div>' +
           '<div class="pi-opt">例句 ' + d.examples.length + ' 条' +
           (d.examples.length ? '：' + esc(d.examples[0].jp) : '') + '</div>' +
+          subLine +
+          (embN ? '<div class="pi-opt">📝 卡片内嵌题目 ' + embN + ' 道（将随卡片一起导入）</div>' : '') +
           (p.valid ? '' : '<div class="pi-err">⚠ ' + p.errors.join('；') + '</div>') +
           '</div>';
       }).join('');
@@ -2284,13 +2580,34 @@
         (noCardKeys.size ? '；另有 ' + noCardKeys.size +
           ' 个考点还没有卡片（章节页显示为灰色词条，可稍后补卡片）' : '');
     } else {
-      const items = valid.map(p => ({ ...p.data, id: Store.uid('c'), bookId, chapterId }));
+      /* questions 只随卡片内嵌导入，不写进卡片记录（落盘时会被归一化剔除） */
+      const items = valid.map(p => {
+        const cardData = { ...p.data };
+        delete cardData.questions;
+        return { ...cardData, id: Store.uid('c'), bookId, chapterId };
+      });
       const r = Store.importCards(items);
+
+      /* 卡片内嵌题目：随卡片一起入库，归属当前选择的书章，并带子考点（用法）标签 */
+      let embedded = 0, embeddedDup = 0;
+      valid.forEach(p => {
+        const list = Array.isArray(p.data.questions) ? p.data.questions : [];
+        list.forEach(qd => {
+          const res = Store.addQuestionToPoint(p.data.name, {
+            ...qd, id: Store.uid('q'), bookId, chapterId
+          });
+          if (res && res.id) embedded++;
+          else embeddedDup++;
+        });
+      });
+
       /* 反向补全：题目先到、卡片后到时，按已有题目的书章归属给新卡片补来源 */
       const es = Store.ensureCardSourcesForQuestions(Store.getQuestions());
       importState.message = '导入成功：新增卡片 ' + r.added + ' 张' +
         (r.appended ? '，为同名卡片追加来源 ' + r.appended + ' 个' : '') +
         (r.updated ? '，更新同书来源 ' + r.updated + ' 个' : '') +
+        (embedded ? '，卡片内嵌题目 ' + embedded + ' 道' : '') +
+        (embeddedDup ? '（重复跳过 ' + embeddedDup + ' 道）' : '') +
         (es.attached ? '；另根据已有题目为卡片补挂来源 ' + es.attached + ' 个' : '') +
         '（归属：' + scopeText(bookId, chapterId) +
         '）。同名考点的不同书讲解会各自独立保留，不会互相覆盖。';
@@ -2303,6 +2620,31 @@
 
   /* ---------- JSON 备份标签 ---------- */
 
+  /** 统计备份包内各类数据条目（兼容不含新字段的旧备份） */
+  function bundleSummary(b) {
+    const n = (arr) => Array.isArray(arr) ? arr.length : 0;
+    const readingBooks = n(b.reading);
+    let readingArticles = 0, readingUnits = 0;
+    (Array.isArray(b.reading) ? b.reading : []).forEach(bk => {
+      const us = Array.isArray(bk.units) ? bk.units : [];
+      readingUnits += us.length;
+      us.forEach(u => { readingArticles += (Array.isArray(u.articles) ? u.articles.length : 0); });
+    });
+    const parts = [
+      n(b.questions) + ' 道题目',
+      n(b.cards) + ' 张考点卡片',
+      n(b.articles) + ' 篇精读文章',
+      readingArticles + ' 篇阅读理解（' + readingBooks + ' 书 / ' + readingUnits + ' 单元）'
+    ];
+    const extras = [];
+    if (n(b.books)) extras.push(n(b.books) + ' 本语法练习书');
+    if (b.practiceDrafts && Object.keys(b.practiceDrafts).length) {
+      extras.push(Object.keys(b.practiceDrafts).length + ' 个练习进度');
+    }
+    if (extras.length) parts.push(extras.join('、'));
+    return parts.join('、');
+  }
+
   function renderJSONTab() {
     return '<button class="btn btn-primary" data-action="export-json" style="margin-bottom:14px">' +
       '📤 导出全部数据（JSON 文件）</button>' +
@@ -2310,10 +2652,13 @@
       '<label>从 JSON 备份文件恢复</label>' +
       '<input type="file" id="jsonFile" accept=".json,application/json">' +
       (pickedBundle
-        ? '<div class="fmt-hint ok">已读取备份：' + pickedBundle.questions.length +
-        ' 题、' + pickedBundle.cards.length + ' 张卡片，请选择导入方式。</div>'
-        : '<div class="fmt-hint">备份包含：题目、考点卡片、完成状态、错题、疑难、考点统计。\n' +
-        '合并导入：题目按 id 去重，其余数据取并集；\n覆盖导入：清空现有数据后完全还原。</div>') +
+        ? '<div class="fmt-hint ok">已读取备份：' + esc(bundleSummary(pickedBundle)) +
+        '，请选择导入方式。</div>'
+        : '<div class="fmt-hint">一键备份全部内容：语法题目与考点卡片、错题/疑难/完成状态、' +
+        '语法练习书架、文章精读、阅读理解书架（书籍/单元/文章与作答进度）、' +
+        '训练场进度、综合练习断点进度与学习模式偏好。\n' +
+        '合并导入：按 id 去重取并集，本机已有数据不会被覆盖；\n' +
+        '覆盖导入：清空当前全部数据后完全还原为备份内容。</div>') +
       '</div>' +
       '<div class="btn-row">' +
       '<button class="btn btn-ghost" data-action="import-json" data-mode="merge">合并导入</button>' +
@@ -2328,7 +2673,10 @@
     const stamp = new Date().toISOString().slice(0, 10);
     download('jp-grammar-backup-' + stamp + '.json',
       JSON.stringify(bundle, null, 2), 'application/json');
-    toast('已导出 JSON 文件');
+    toast('已导出全部数据（含阅读理解 ' +
+      ((bundle.reading || []).reduce((m, bk) => m +
+        ((bk.units || []).reduce((n, u) => n + ((u.articles || []).length), 0)), 0)) +
+      ' 篇）');
   }
 
   let pickedBundle = null;
@@ -2336,19 +2684,28 @@
   function doImportJSON(mode) {
     if (!pickedBundle) { toast('请先选择备份文件'); return; }
     if (mode === 'replace' &&
-      !confirm('覆盖导入会清空当前全部数据并还原为备份内容，确定继续？')) return;
+      !confirm('覆盖导入会清空当前全部数据并还原为备份内容（含阅读理解书架、文章精读），确定继续？')) return;
     try {
       const r = Store.importBundle(pickedBundle, mode);
-      importState.message = r.replaced
-        ? '已覆盖还原：' + r.questions + ' 题（多来源信息已保留）'
-        : '合并完成：新增题目 ' + r.questions + ' 题' +
-        (r.questionsDup ? '，重复跳过 ' + r.questionsDup + ' 题' : '') +
-        '；卡片新增 ' + r.cardsAdded + ' / 追加来源 ' +
-        (r.cardsAppended || 0) + ' / 更新来源 ' + r.cardsUpdated +
-        (r.cardSourcesAttached ? ' / 题目自动补挂来源 ' + r.cardSourcesAttached : '');
+      const rd = r.reading || { books: 0, units: 0, articles: 0 };
+      if (r.replaced) {
+        importState.message = '已覆盖还原：' + r.questions + ' 题' +
+          '、' + (pickedBundle.cards || []).length + ' 张卡片' +
+          (rd.articles ? '、阅读理解 ' + rd.articles + ' 篇' : '') +
+          '（多来源信息已保留）';
+      } else {
+        importState.message = '合并完成：新增题目 ' + r.questions + ' 题' +
+          (r.questionsDup ? '，重复跳过 ' + r.questionsDup + ' 题' : '') +
+          '；卡片新增 ' + r.cardsAdded + ' / 追加来源 ' +
+          (r.cardsAppended || 0) + ' / 更新来源 ' + r.cardsUpdated +
+          (r.cardSourcesAttached ? ' / 题目自动补挂来源 ' + r.cardSourcesAttached : '') +
+          (rd.articles ? '；阅读理解新增 ' + rd.articles + ' 篇（' +
+            rd.books + ' 书 / ' + rd.units + ' 单元）' : '');
+      }
       pickedBundle = null;
       const fileEl = document.getElementById('jsonFile');
       if (fileEl) fileEl.value = '';
+      refreshBadge();
       renderImport();
     } catch (e) {
       toast(e.message || '导入失败');
@@ -2374,8 +2731,10 @@
 
     return '<div class="fmt-hint" style="margin-bottom:12px">共 ' + groups.length +
       ' 个考点、' + qs.length + ' 道题。删除操作会同时清理对应的错题与疑难记录。</div>' +
+      '<div class="search-zone">' + searchBarHTML('搜索考点名称 / 门类') +
+      '<div class="search-rows">' +
       groups.map(g =>
-        '<div class="manage-item">' +
+        '<div class="manage-item" data-csearch="' + esc(g.point + ' ' + g.category) + '">' +
         '<div class="mi-info"><div class="mi-name">' + esc(g.point) + '</div>' +
         '<div class="mi-sub">' + esc(g.category) + ' · ' + g.count + ' 题</div></div>' +
         '<div class="mi-btns">' +
@@ -2385,6 +2744,8 @@
         esc(g.point) + '">只保留它</button>' +
         '</div>' +
         '</div>').join('') +
+      '</div>' +
+      '<div class="search-empty" hidden>🔍 没有匹配的考点</div></div>' +
       (importState.message
         ? '<div class="json-result-msg">' + esc(importState.message) + '</div>' : '');
   }
@@ -2446,10 +2807,10 @@
         const pct = p.total ? Math.round(p.done / p.total * 100) : 0;
         const progHTML = p.total
           ? '<div class="sc-progress"><div class="scp-bar"><i style="width:' + pct + '%"></i></div>' +
-            '<div class="scp-txt"><span class="fresh">未刷 ' + p.fresh + '</span>' +
-            '<span class="half">半截 ' + p.half + '</span>' +
-            '<span class="done">刷完 ' + p.done + '</span>' +
-            '<em>共 ' + p.total + ' 卡</em></div></div>'
+          '<div class="scp-txt"><span class="fresh">未刷 ' + p.fresh + '</span>' +
+          '<span class="half">半截 ' + p.half + '</span>' +
+          '<span class="done">刷完 ' + p.done + '</span>' +
+          '<em>共 ' + p.total + ' 卡</em></div></div>'
           : '<div class="sc-progress scp-empty">本单元还没有卡片</div>';
         const moreHTML = isLoose ? '' :
           '<details class="sb-more"><summary>⋯</summary>' +
@@ -2523,11 +2884,50 @@
     const qs = Store.getQuestions().filter(q => !q.reading && q.bookId === bookId);
     if (!qs.length) { toast('这本书还没有题目'); return; }
     const book = Store.getBookById(bookId);
-    startSession('chapter', '《' + (book ? book.name : '未知') + '》随机练习', qs);
-    if (session) { session.bookId = bookId; session.chapterId = ''; }
+    startSession('chapter', '《' + (book ? book.name : '未知') + '》随机练习', qs,
+      '', '', '', PK.book(bookId));
+    if (session) { session.bookId = bookId; session.chapterId = ''; persistSession(); }
   }
 
   function renderPractice() {
+    /* 进度先按当前题库校验（整章/整书删除后自动清掉对应草稿） */
+    Store.prunePracticeDrafts();
+    const drafts = Store.getPracticeDrafts();
+
+    /** 某练习范围的已答进度：至少答过 1 题才返回 {answered,total} */
+    const draftInfo = key => {
+      const d = drafts[key];
+      if (!d || !Array.isArray(d.items)) return null;
+      const answered = d.items.filter(it => it.chosen !== null).length;
+      return answered ? { answered, total: d.items.length } : null;
+    };
+
+    /** 行内蓝紫进度条 + 「点击继续」 */
+    const progressHTML = info => {
+      const pct = Math.round(info.answered / info.total * 100);
+      return '<div class="pr-prog"><div class="scp-bar"><i style="width:' + pct + '%"></i>' +
+        '</div><span class="pr-prog-txt">已答 ' + info.answered + ' / ' + info.total +
+        ' · 点击继续</span></div>';
+    };
+
+    /** 练习行（章节 / 未分章节 / 未分类通用）：有进度时显示继续与清除 */
+    const rowHTML = (action, attrs, ico, name, n, key) => {
+      const info = draftInfo(key);
+      const attrStr = Object.keys(attrs).map(k =>
+        ' data-' + k + '="' + esc(attrs[k]) + '"').join('');
+      return '<div class="pr-chapter' + (info ? ' has-draft' : '') +
+        '" data-action="' + action + '"' + attrStr + '>' +
+        '<span class="sc-ico">' + ico + '</span>' +
+        '<div class="pr-body"><div class="pr-line">' +
+        '<span class="sc-name">' + esc(name) + '</span>' +
+        '<span class="sc-count">' + n + ' 题</span></div>' +
+        (info ? progressHTML(info) : '') + '</div>' +
+        '<span class="pr-go">' + (info ? '继续 ' : '') + '▶</span>' +
+        (info ? '<button class="pr-clear" data-action="practice-clear" data-key="' +
+          esc(key) + '" title="清除进度，从头再练">✕</button>' : '') +
+        '</div>';
+    };
+
     const qs = Store.getQuestions().filter(q => !q.reading && q.bookId);
     const total = qs.length;
     const books = Store.getBooks()
@@ -2541,15 +2941,23 @@
       const loose = list.filter(q => !q.chapterId).length;
 
       const chRow = (cid, name, n) =>
-        n ? '<div class="pr-chapter" data-action="practice-chapter" data-book="' +
-          esc(b.id) + '" data-chapter="' + esc(cid) + '">' +
-          '<span class="sc-ico">📄</span><span class="sc-name">' + esc(name) + '</span>' +
-          '<span class="sc-count">' + n + ' 题</span><span class="sb-go">▶</span></div>' : '';
+        rowHTML('practice-chapter', { book: b.id, chapter: cid },
+          '📄', name, n, PK.ch(b.id, cid));
 
       const chaptersHTML = chapters
         .map(ch => chRow(ch.id, ch.name, list.filter(q => q.chapterId === ch.id).length))
         .join('');
       const looseHTML = loose ? chRow('', '未分章节', loose) : '';
+
+      /* 练整本：有未完成进度时按钮变「继续 x/y」并配清除 */
+      const bookInfo = draftInfo(PK.book(b.id));
+      const bookBtns = bookInfo
+        ? '<button class="btn-mini pr-resume" data-action="practice-book" data-id="' +
+        esc(b.id) + '">继续 ' + bookInfo.answered + '/' + bookInfo.total + '</button>' +
+        '<button class="pr-clear" data-action="practice-clear" data-key="' +
+        esc(PK.book(b.id)) + '" title="清除进度，从头再练">✕</button>'
+        : '<button class="btn-mini" data-action="practice-book" data-id="' +
+        esc(b.id) + '">练整本</button>';
 
       return '<div class="shelf-book pr-book">' +
         '<div class="sb-head">' +
@@ -2558,27 +2966,35 @@
         '<div class="sb-text"><div class="sb-name">📖 ' + esc(b.name) + '</div>' +
         '<div class="sb-sub">' + list.length + ' 题</div></div>' +
         '<span class="sb-go">›</span></div>' +
-        '<div class="sb-btns"><button class="btn-mini" data-action="practice-book" data-id="' +
-        esc(b.id) + '">练整本</button></div></div>' +
+        '<div class="sb-btns">' + bookBtns + '</div></div>' +
         '<div class="sb-chapters"' + (open ? '' : ' hidden') + '>' +
         chaptersHTML + looseHTML + '</div></div>';
     }).join('');
 
     const uncatRow = uncategorized
-      ? '<div class="shelf-book uncategorized"><div class="pr-chapter" ' +
-        'data-action="practice-uncat">' +
-        '<span class="sc-ico">📂</span><span class="sc-name">未分类题目</span>' +
-        '<span class="sc-count">' + uncategorized + ' 题</span>' +
-        '<span class="sb-go">▶</span></div></div>' : '';
+      ? '<div class="shelf-book uncategorized">' +
+      rowHTML('practice-uncat', {}, '📂', '未分类题目', uncategorized, PK.UNCAT) +
+      '</div>' : '';
+
+    /* 随机练习全部：有未完成进度时主按钮直接续上次 */
+    const mixedInfo = draftInfo(PK.MIXED);
+    const randomHTML = mixedInfo
+      ? '<div class="pr-main-row">' +
+      '<button class="btn btn-primary shelf-new-btn" data-action="practice-random">' +
+      '▶ 继续上次随机练习（' + mixedInfo.answered + ' / ' + mixedInfo.total + '）</button>' +
+      '<button class="pr-clear lg" data-action="practice-clear" data-key="' + PK.MIXED +
+      '" title="清除进度，重新随机">✕</button></div>'
+      : '<button class="btn btn-primary shelf-new-btn" data-action="practice-random"' +
+      (total ? '' : ' disabled') + '>🎲 随机练习全部（' + total + ' 题）</button>';
 
     setHTML(
       '<header class="page-head"><h1>综合练习</h1>' +
       '<div class="sub">选一本书、展开目录，点章节直接开练</div></header>' +
-      '<button class="btn btn-primary shelf-new-btn" data-action="practice-random"' +
-      (total ? '' : ' disabled') + '>🎲 随机练习全部（' + total + ' 题）</button>' +
+      randomHTML +
       '<div class="fmt-hint" style="margin-bottom:12px">这里只有已归入语法练习书章节的题目，' +
       '不涉及首页考点卡片；做题时点选项右侧的 📇 可查看该选项对应的语法点卡片，' +
-      '可用顶部「学习模式 / 训练模式」开关控制作答前能否查看。</div>' +
+      '可用顶部「学习模式 / 训练模式」开关控制作答前能否查看。' +
+      '答题进度会自动保存，随时可离开、下次接着练。</div>' +
       (booksHTML || uncatRow ||
         '<div class="empty"><span class="e-ico">📚</span>' +
         '<div class="e-txt">还没有练习书题目<br>到「批量导入」导入语法书题目，并归入书籍章节</div>' +
@@ -2643,7 +3059,8 @@
         ' data-name="' + esc(name) + '"' + scopeAttrs + '>移出本章</button>'
         : '<button class="btn-mini danger" data-action="ch-del-point-qs"' +
         ' data-name="' + esc(name) + '"' + scopeAttrs + '>删除题目</button>';
-      return '<div class="manage-item chapter-point' + (hasCard ? '' : ' no-card') + '">' +
+      return '<div class="manage-item chapter-point' + (hasCard ? '' : ' no-card') +
+        '" data-csearch="' + esc(hasCard ? cardSearchText(hasCard) : name) + '">' +
         '<div class="mi-info"><div class="mi-name">' + main + '</div>' +
         '<div class="mi-sub">' + (hasCard ? esc(hasCard.category) : '暂无卡片') +
         ' · ' + count + ' 题</div></div>' +
@@ -2659,12 +3076,24 @@
       '<header class="page-head"><h1>📖 ' + esc(title) + '</h1>' +
       '<div class="sub">' + qs.length + ' 题 · ' + cards.length + ' 张卡片</div></header>' +
       (qs.length
-        ? '<button class="btn btn-primary" data-action="chapter-practice" data-book="' +
+        ? '<div class="ch-actions">' +
+        '<button class="btn btn-primary" data-action="chapter-practice" data-book="' +
         esc(scopeToRoute(bookId)) + '" data-chapter="' + esc(scopeToRoute(chapterId)) +
-        '" style="margin-bottom:14px">练习本章全部题目（' + qs.length + ' 题）</button>'
+        '">练习本章全部题目（' + qs.length + ' 题）</button>' +
+        '<button class="btn btn-danger" data-action="ch-del-all-qs"' + scopeAttrs +
+        '>🗑 一键删除本章全部题目</button></div>'
+        : '') +
+      /* 未分类目录：一键删除所有卡片（摘除未分类来源；唯一来源的卡片整卡删除，题目保留） */
+      (!bookId && !chapterId && cards.length
+        ? '<div class="ch-actions">' +
+        '<button class="btn btn-danger" data-action="uncat-del-all-cards"' +
+        '>🗑 一键删除所有卡片（' + cards.length + ' 张）</button></div>'
         : '') +
       (points.length
-        ? '<div class="section-title">考点 <span class="count">点击查看卡片详情</span></div>' + rows
+        ? '<div class="section-title">考点 <span class="count">点击查看卡片详情</span></div>' +
+        '<div class="search-zone">' + searchBarHTML('搜索本章语法') +
+        '<div class="search-rows">' + rows + '</div>' +
+        '<div class="search-empty" hidden>🔍 本章没有匹配的语法</div></div>'
         : '<div class="empty"><span class="e-ico">🗂</span>' +
         '<div class="e-txt">本章还没有题目或卡片<br>到「导入」页粘贴内容，并选择归属到本章</div>' +
         '<a class="btn btn-primary" href="#/import">去导入</a>' +
@@ -2677,8 +3106,9 @@
     const qs = Store.getQuestions()
       .filter(q => (q.bookId || '') === bookId && (q.chapterId || '') === chapterId);
     if (!qs.length) { toast('本章还没有题目'); return; }
-    startSession('chapter', scopeText(bookId, chapterId), qs);
-    if (session) { session.bookId = bookId; session.chapterId = chapterId; }
+    startSession('chapter', scopeText(bookId, chapterId), qs,
+      '', '', '', PK.ch(bookId, chapterId));
+    if (session) { session.bookId = bookId; session.chapterId = chapterId; persistSession(); }
   }
 
   /**
@@ -2737,6 +3167,49 @@
     const removed = Store.deleteQuestionsByPointScope(name, bookId, chapterId);
     toast('已删除本章题目 ' + removed + ' 道');
     renderChapter(bookId, chapterId);
+  }
+
+  /** 章节页「一键删除本章全部题目」：只删本来源的题，卡片与单元本身保留 */
+  function chapterDeleteAllQuestions(bookRoute, chapterRoute) {
+    const bookId = scopeFromRoute(bookRoute);
+    const chapterId = scopeFromRoute(chapterRoute);
+    const qs = Store.getQuestions().filter(q => !q.reading &&
+      (q.bookId || '') === bookId && (q.chapterId || '') === chapterId);
+    if (!qs.length) { toast('本章还没有题目'); renderChapter(bookId, chapterId); return; }
+    if (!confirm('一键删除「' + scopeText(bookId, chapterId) + '」的全部 ' + qs.length +
+      ' 道题目？\n\n· 同时清理这些题的错题/疑难记录；\n' +
+      '· 考点卡片和本单元本身保留；\n· 其他章节/书籍中的同名题目不受影响。')) return;
+    const removed = Store.deleteQuestionsByIds(qs.map(q => q.id));
+    /* 正在练本章的会话同步作废，避免续练时题目已不存在 */
+    const pkey = PK.ch(bookId, chapterId);
+    Store.deletePracticeDraft(pkey);
+    Store.clearActivePracticeKey(pkey);
+    if (session && session.draftKey === pkey) session = null;
+    toast('已删除本章全部题目 ' + removed + ' 道');
+    renderChapter(bookId, chapterId);
+  }
+
+  /**
+   * 未分类页「一键删除所有卡片」：摘除所有卡片的「未分类」来源。
+   * 唯一来源的卡片整卡删除（题目保留，转为“缺卡片”灰条）；
+   * 多来源卡片只摘除未分类来源，其他章节/书籍的卡片内容不受影响。
+   */
+  function uncatDeleteAllCards() {
+    const cards = Store.getCards().filter(c => Store.cardHasScope(c, '', ''));
+    if (!cards.length) { toast('未分类下没有卡片'); renderChapter('', ''); return; }
+    if (!confirm('一键删除未分类下的全部 ' + cards.length + ' 张卡片？\n\n' +
+      '· 只在未分类里的卡片：整卡删除（讲解、例句一并删除）；\n' +
+      '· 同时归属其他章节/书籍的卡片：仅摘除未分类来源，其他来源保留；\n' +
+      '· 未分类题目不受影响。')) return;
+    let cardRemoved = 0, scopeRemoved = 0;
+    cards.forEach(c => {
+      const r = Store.deleteCardScope(c.name, '', '');
+      if (r && r.removed === 'card') cardRemoved++;
+      else if (r && r.removed === 'source') scopeRemoved++;
+    });
+    toast('已删除未分类卡片：整卡删除 ' + cardRemoved +
+      ' 张，摘除未分类来源 ' + scopeRemoved + ' 张');
+    renderChapter('', '');
   }
 
   /* ---------- 书架操作 ---------- */
@@ -2883,7 +3356,13 @@
     switch (action) {
       case 'start-point': startPoint(el.dataset.name); break;
       /* 卡片详情：多来源 + 来源筛选刷题 */
-      case 'card-start': startPoint(currentCardName, cardSourceFilter); break;
+      case 'card-start':
+        startPoint(currentCardName, cardSourceFilter, cardSubFilter);
+        break;
+      case 'card-sub':
+        cardSubFilter = el.dataset.sub || '';
+        renderCard(currentCardName);
+        break;
       case 'card-src':
         cardSourceFilter = (el.dataset.book === undefined) ? '' : el.dataset.book;
         renderCard(currentCardName);
@@ -2912,6 +3391,7 @@
         if (session && !session.finished) {
           session.learnMode = el.dataset.mode === 'train' ? 'train' : 'learn';
           setLearnModePref(session.learnMode);
+          persistSession();
           renderQuiz();
         }
         break;
@@ -3040,38 +3520,87 @@
       case 'shelf-open':
         location.hash = '#/chapter/' + el.dataset.book + '/' + el.dataset.chapter;
         break;
-      case 'chapter-practice':
-        startChapter(scopeFromRoute(el.dataset.book), scopeFromRoute(el.dataset.chapter));
+      case 'chapter-practice': {
+        const cb = scopeFromRoute(el.dataset.book);
+        const cc = scopeFromRoute(el.dataset.chapter);
+        resumeOrStart(PK.ch(cb, cc), () => startChapter(cb, cc));
         break;
+      }
       case 'ch-detach-card':
         chapterDetachCard(el.dataset.name, el.dataset.book, el.dataset.chapter);
         break;
       case 'ch-del-point-qs':
         chapterDeletePointQuestions(el.dataset.name, el.dataset.book, el.dataset.chapter);
         break;
+      case 'ch-del-all-qs':
+        chapterDeleteAllQuestions(el.dataset.book, el.dataset.chapter);
+        break;
+      case 'uncat-del-all-cards':
+        uncatDeleteAllCards();
+        break;
+      case 'search-clear': {
+        const bar = el.closest('.search-bar');
+        const input = bar && bar.querySelector('.card-search-input');
+        if (input) {
+          input.value = '';
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.focus();
+        }
+        break;
+      }
 
-      /* 综合练习：书籍 → 章节 → 直接刷题 */
+      /* 综合练习：书籍 → 章节 → 直接刷题（有未答完的进度自动续练） */
       case 'practice-toggle':
         practiceExpanded = practiceExpanded === el.dataset.id ? '' : el.dataset.id;
         renderPractice();
         break;
-      case 'practice-chapter':
-        startChapter(el.dataset.book, el.dataset.chapter || '');
+      case 'practice-chapter': {
+        const pb = el.dataset.book || '';
+        const pc = el.dataset.chapter || '';
+        resumeOrStart(PK.ch(pb, pc), () => startChapter(pb, pc));
         break;
+      }
       case 'practice-book':
-        startBookPractice(el.dataset.id);
+        resumeOrStart(PK.book(el.dataset.id), () => startBookPractice(el.dataset.id));
         break;
       case 'practice-random':
-        startMixed();
+        resumeOrStart(PK.MIXED, startMixed);
         break;
       case 'practice-uncat':
-        startSession('mixed', '未分类题目 · 随机',
-          Store.getQuestions().filter(q => !q.reading && !q.bookId));
+        resumeOrStart(PK.UNCAT, startUncatPractice);
         break;
+      case 'practice-clear': {
+        const pkey = el.dataset.key || '';
+        Store.deletePracticeDraft(pkey);
+        Store.clearActivePracticeKey(pkey);
+        /* 内存里同一练习也作废，避免再被当成可续练会话 */
+        if (session && session.draftKey === pkey) session = null;
+        toast('已清除该练习的进度');
+        renderPractice();
+        break;
+      }
     }
   });
 
-  /* change 事件：归属下拉 + JSON 文件选择 */
+  /* ---------- 卡片列表搜索：输入即过滤（纯 DOM 显隐，不重渲染、不丢焦点） ---------- */
+  document.addEventListener('input', function (e) {
+    const el = e.target;
+    if (!el.classList || !el.classList.contains('card-search-input')) return;
+    const zone = el.closest('.search-zone');
+    if (!zone) return;
+    const q = el.value;
+    let shown = 0;
+    zone.querySelectorAll('[data-csearch]').forEach(row => {
+      const hit = fuzzyHit(q, row.getAttribute('data-csearch'));
+      row.hidden = !hit;
+      if (hit) shown++;
+    });
+    const empty = zone.querySelector('.search-empty');
+    if (empty) empty.hidden = !(q.trim() && shown === 0);
+    const clearBtn = zone.querySelector('.search-clear');
+    if (clearBtn) clearBtn.hidden = !q;
+  });
+
   document.addEventListener('change', function (e) {
     if (e.target.id === 'ownerBook') {
       importState.bookId = e.target.value || '';
@@ -3188,6 +3717,8 @@
   Store.purgeBuiltinBank();
   /* v6.1：旧卡片补「来源」层、旧题目补来源字段，幂等不丢数据 */
   Store.migrateSources();
+  /* v6.2：综合练习断点进度按当前题库校验，清掉已删题目的残留 */
+  Store.prunePracticeDrafts();
   window.addEventListener('hashchange', router);
   if (!location.hash) {
     /* 程序首次设置 #/home 触发的 hashchange 不计入前进深度 */
