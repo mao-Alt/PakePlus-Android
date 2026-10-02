@@ -11,6 +11,14 @@
  *
  * 语法识别：把题库中每张卡片的名称转成正则（～→通配、（）→可选、・／→变体），
  * 在文章中匹配定位；题库没有的常见语法走 EXTRA_GRAMMAR 探测表，标记为"新语法点"。
+ *
+ * 误判防护（纯本地规则 + 分词器，不调用 AI）：
+ *   ① 短核心词边界——きる/なり 等两假名核心右侧再贴平假名即视为词的一部分；
+ *   ② 单汉字防护——際/上 这类单汉字核心两侧贴汉字时判为汉语词（国際・売上）；
+ *   ③ LEXICAL_BLOCK 常见词排除表——できる(含きる)、かなり(含なり) 等整体排除；
+ *   ④ 词性过滤（kuromoji）——命中区间戳进 名詞/動詞-自立/形容詞/副詞 内部即拒绝，
+ *      如 手紙の「て」、増す→ます；词典未加载时自动回退到 ①-③ 规则引擎。
+ *   命中区间再按「长者优先 + 优先级」消重叠，避免把一个词拆成两个语法点。
  * =================================================================== */
 
 (function () {
@@ -51,9 +59,144 @@
 
   /* 假名 / 日文词字符类（词边界判定用，含半角假名） */
   const KANA_CHAR = /[ぁ-んァ-ヶｦ-ﾟ]/;
+  const HIRA_CHAR = /[ぁ-ん]/;
+  const KANJI_CHAR = /[一-龯㐀-䶿々〆〤]/;
   const JP_WORD_CHAR = /[ぁ-んァ-ヶｦ-ﾟ一-龯㐀-䶿々〆〤ーｰ]/;
-  /* 单假名短语法命中后，允许跟随的助词（其余假名一律视为仍在词内） */
-  const PARTICLE_AFTER = /^[かがさたなはまやらわとでにのをもねよぜぞばぱ]$/;
+  /* 短语法命中后，允许紧跟的助词 / 接续成分（其余平假名一律视为仍在词内）
+     こ＝こと・こそ、そ＝そうだ、ん＝んだ、て＝ても、だ＝判断助动词、
+     わ＝わけだ、す＝たりする 等紧跟的轻动词 する */
+  const PARTICLE_AFTER = /^[かがさたなはまやらわとでにのをもねよぜぞばぱこそんてだわす]$/;
+  /* 两假名核心但右侧需要直接接动词的（さえあれば），不做右侧词边界约束 */
+  const RIGHT_ATTACH = { 'さえ': 1 };
+
+  /*
+   * 常见词误判排除表：词内恰好包含某语法核心，命中区间落在这些词上时直接丢弃。
+   *   できる→きる、かなり→なり、はっきり/すっきり/まるきり→きり、
+   *   いたる/あたる/ほたる→たる、うつつ→つつ、ふたり/まったり→たり、
+   *   みたい/もったいない/たいする→たい、ありがたい→がたい、
+   *   もてる→てる、とくに→とく、なりすます→なり
+   * 以后再发现类似误判词，直接往这个数组里加即可（写平假名原形）。
+   */
+  const LEXICAL_BLOCK = [
+    'できる', 'もてる', 'とくに',
+    'かなり', 'なりすます',
+    'はっきり', 'すっきり', 'まるきり',
+    'いたる', 'あたる', 'ほたる',
+    'うつつ',
+    'まったり', 'ふたり',
+    'みたい', 'もったいない', 'たいする',
+    'ありがたい'
+  ];
+
+  /* ================= 词性过滤层（kuromoji 分词器，可选增强） =================
+   * 词典（dict/ 目录）加载成功后启用；加载失败（如 file:// 直接打开）静默回退规则引擎。
+   * 核心原则：命中区间不得「戳进」内容词 token 内部——
+   *   手紙(名詞)里的 て、空手(名詞)里的 から、増す(動詞-自立)里的 ます 都会被拒绝；
+   * 例外：～きる / ～がたい 等复合动词后缀语法允许命中 動詞-自立 的词尾（食べきる→きる）。
+   */
+  const POS_BLOCK = { '名詞': 1, '副詞': 1, '連体詞': 1, '感動詞': 1, '接続詞': 1, '形容詞': 1 };
+
+  /* 允许作为「动词词尾后缀」命中的语法核心（其余命中 動詞-自立 内部的一律拒绝） */
+  const SUFFIX_CORES = {
+    'きる': 1, 'きれる': 1, 'ぬく': 1, 'かける': 1, 'かねる': 1,
+    'がたい': 1, 'にくい': 1, 'やすい': 1, 'づらい': 1, 'がち': 1,
+    'っぱなし': 1, 'すぎる': 1, 'おわる': 1, 'はじめる': 1, 'つづける': 1,
+    'だす': 1, 'あがる': 1, 'あう': 1, 'がる': 1
+  };
+
+  /* 模式级词性约束：语法核心 → 命中区间必须整体覆盖该词性的 token。
+     敬体 ます 必须是助動詞（行き→ます），不能是动词 増す（においがます）；
+     单助词语法必须是助詞，防止分词异常时把名词残片当助词。 */
+  const POS_REQUIRED = {
+    'ます': ['助動詞'], 'ました': ['助動詞'], 'ません': ['助動詞'], 'ませんでした': ['助動詞'],
+    'ましょう': ['助動詞'],
+    'て': ['助詞'], 'で': ['助詞'], 'と': ['助詞'], 'から': ['助詞'], 'まで': ['助詞'],
+    'に': ['助詞'], 'が': ['助詞'], 'を': ['助詞'], 'は': ['助詞'], 'も': ['助詞'],
+    'へ': ['助詞'], 'の': ['助詞'], 'よ': ['助詞'], 'ね': ['助詞'], 'ば': ['助詞'],
+    'や': ['助詞'], 'な': ['助詞'], 'ぞ': ['助詞'], 'ぜ': ['助詞'], 'わ': ['助詞'],
+    'だ': ['助動詞'], 'です': ['助動詞']
+  };
+
+  let posTokenizer = null;   // 分词器实例，就绪后 analyze 自动启用词性过滤
+  let posLoading = false;
+  let posFailed = false;
+  let posWaiters = [];
+
+  function posReady() { return !!posTokenizer; }
+
+  function flushPosWaiters(ok) {
+    const ws = posWaiters; posWaiters = [];
+    ws.forEach(function (f) { try { f(ok); } catch (e) { } });
+  }
+
+  /** 懒加载分词器；cb(ok) 在就绪/失败时回调（已就绪或已失败则立即回调） */
+  function ensureTokenizer(cb) {
+    if (posTokenizer) { if (cb) cb(true); return; }
+    if (posFailed) { if (cb) cb(false); return; }
+    if (cb) posWaiters.push(cb);
+    if (posLoading) return;
+    if (typeof kuromoji === 'undefined') { posFailed = true; flushPosWaiters(false); return; }
+    posLoading = true;
+    try {
+      kuromoji.builder({ dicPath: 'dict' }).build(function (err, t) {
+        posLoading = false;
+        if (err || !t) { posFailed = true; flushPosWaiters(false); return; }
+        posTokenizer = t;
+        flushPosWaiters(true);
+      });
+    } catch (e) {
+      posLoading = false;
+      posFailed = true;
+      flushPosWaiters(false);
+    }
+  }
+
+  /** 该语法名是否为动词后缀型（～きる 等），决定动词词尾命中是否放行 */
+  function isSuffixGrammar(name) {
+    const cores = normCores(name);
+    for (let i = 0; i < cores.length; i++) {
+      if (SUFFIX_CORES[cores[i]]) return true;
+    }
+    return false;
+  }
+
+  /** 单个命中区间 vs 分词结果：戳进内容词内部 → false */
+  function posHitOK(toks, h) {
+    const hs = h.start, he = h.end;
+    let reqOk = !h.posRequired;
+    for (let i = 0; i < toks.length; i++) {
+      const tk = toks[i];
+      if (tk.e <= hs) continue;
+      if (tk.s >= he) break;
+      const whole = hs <= tk.s && he >= tk.e;
+      if (whole) {   // 整体覆盖：复合语法本就由这些 token 组成（てから／ことは…）
+        if (!reqOk && h.posRequired.indexOf(tk.pos) !== -1) reqOk = true;
+        continue;
+      }
+      /* 部分覆盖（命中戳进 token 内部） */
+      if (POS_BLOCK[tk.pos]) return false;                 // 名詞・副詞・形容詞等内部 → 误判
+      if (tk.pos === '動詞' && tk.d1 === '自立') {
+        /* 动词词尾后缀语法放行；増す→ます 因 ます∉SUFFIX_CORES 被拦截 */
+        if (he === tk.e && hs > tk.s && h.suffixOK) continue;
+        return false;
+      }
+      return false;   // 助詞/助動詞/非自立被部分覆盖：异常分词，保守拒绝
+    }
+    /* 模式级词性约束：敬体ます→助動詞、单助词语法→助詞（拦截 増す→ます 这类整体覆盖误判） */
+    return reqOk;
+  }
+
+  /** 词性过滤主入口：分词器未就绪时原样返回（规则引擎兜底） */
+  function posFilterHits(text, hits) {
+    if (!posTokenizer) return hits;
+    let raw;
+    try { raw = posTokenizer.tokenize(text); } catch (e) { return hits; }
+    const toks = raw.map(function (tk) {
+      const s = tk.word_position - 1;
+      return { s: s, e: s + tk.surface_form.length, pos: tk.pos, d1: tk.pos_detail_1 };
+    });
+    return hits.filter(function (h) { return posHitOK(toks, h); });
+  }
 
   /* 括号配对表：全角/半角圆括号、［］、【】、{} */
   const BRACKET_CLOSE = {
@@ -148,6 +291,8 @@
       re._brkPos = re._hasBracket ? '前' : '';
       re._core = forms[0];
       re._boundary = false;
+      re._kanaShort = false;
+      re._kanjiOne = false;
       return re;
     }
     return null;
@@ -214,8 +359,16 @@
     re._hasBracket = hasBracket;
     re._brkPos = pos.join(',');
     re._core = core;
-    /* 单假名短语法加词边界（如 ～う 不得命中 思う）；汉字骨架（際/上 等）不受限 */
+    /* 单假名短语法加词边界（如 ～う 不得命中 思う） */
     re._boundary = core.length === 1 && KANA_CHAR.test(core);
+    /* 两假名核心（きる/なり/がち/ほど…）右侧再贴平假名多半是词的延续，
+       如 できる 尾 きる、ほどける 头 ほど；含中间通配符的长模板不做此约束，
+       さえ 类右侧需要直接接动词，放行 */
+    const hasWild = kinds.indexOf('W') !== -1;
+    re._kanaShort = !re._boundary && !hasWild && core.length === 2 &&
+      HIRA_CHAR.test(core[0]) && HIRA_CHAR.test(core[1]) && !RIGHT_ATTACH[core];
+    /* 单汉字核心（際/上）：两侧再贴汉字即 国際・売上 这类汉语词，不是语法 */
+    re._kanjiOne = core.length === 1 && KANJI_CHAR.test(core);
     return re;
   }
 
@@ -234,13 +387,47 @@
     return out;
   }
 
-  /** 单假名短语法的词边界：前不接日文词字符，后不接（助词之外的）假名 */
-  function boundaryOK(text, start, end) {
+  /**
+   * 命中位置的词边界约束（元数据挂在正则对象上）：
+   *  - _boundary  单假名语法：前不接词字符，后只跟助词（思う 不命中 ～う）
+   *  - _kanaShort 两假名核心：右侧紧跟平假名且不是助词/接续成分 → 词的一部分
+   *  - _kanjiOne  单汉字核心：两侧贴汉字即汉语词（国際・売上・実際）
+   */
+  function boundaryOK(text, start, end, re) {
     const p = text.charAt(start - 1);
-    if (p && JP_WORD_CHAR.test(p)) return false;
     const q = text.charAt(end);
-    if (q && KANA_CHAR.test(q) && !PARTICLE_AFTER.test(q)) return false;
+    if (re._boundary) {
+      if (p && JP_WORD_CHAR.test(p)) return false;
+      if (q && KANA_CHAR.test(q) && !PARTICLE_AFTER.test(q)) return false;
+    }
+    if (re._kanaShort && q && HIRA_CHAR.test(q) && !PARTICLE_AFTER.test(q)) return false;
+    if (re._kanjiOne) {
+      if (p && KANJI_CHAR.test(p)) return false;
+      /* 右侧汉字检查只在匹配面以汉字收尾时生效：上達・上手 是汉语词，
+         而「際は／上で」已带出助词は・で，后面的汉字是下一个词（際は発言） */
+      if (q && KANJI_CHAR.test(q) && KANJI_CHAR.test(text.charAt(end - 1))) return false;
+    }
     return true;
+  }
+
+  /**
+   * 命中区间是否落在 LEXICAL_BLOCK 常见排除词上。
+   * 先把区间向两侧扩成完整的「日文词串」，再找与命中区间真正重叠的排除词
+   *（はっきりしている 中的 ている 不能被 はっきり 连累）。
+   */
+  function lexicalBlocked(text, start, end) {
+    let s = start, e = end;
+    while (s > 0 && JP_WORD_CHAR.test(text.charAt(s - 1))) s--;
+    while (e < text.length && JP_WORD_CHAR.test(text.charAt(e))) e++;
+    for (let i = 0; i < LEXICAL_BLOCK.length; i++) {
+      const w = LEXICAL_BLOCK[i], wlen = w.length;
+      let p = s;
+      while ((p = text.indexOf(w, p)) !== -1 && p < e) {
+        if (p + wlen > start && p < end) return true;
+        p += wlen;
+      }
+    }
+    return false;
   }
 
   /** 用户显式标记为重点的卡片（字段预留）；冲突时优先于普通卡片 */
@@ -261,8 +448,11 @@
       if (cores.some(function (v) { return v.length >= 2 && knownCores[v]; })) return;
       cores.forEach(function (v) { if (v.length >= 2) knownCores[v] = 1; });
       const key = gramKeyOf(c.name);
+      /* 模式级词性约束：核心命中 POS_REQUIRED 表时，命中必须覆盖对应词性的 token */
+      let posReq = null;
+      cores.forEach(function (v) { if (!posReq && POS_REQUIRED[v]) posReq = POS_REQUIRED[v]; });
       variantsOf(c.name).forEach(function (re) {
-        matchers.push({ card: c, extra: null, re: re, key: key });
+        matchers.push({ card: c, extra: null, re: re, key: key, posRequired: posReq });
       });
     });
 
@@ -271,7 +461,9 @@
       const cores = normCores(x.name);
       if (cores.some(function (v) { return v.length >= 2 && knownCores[v]; })) return;
       try {
-        matchers.push({ card: null, extra: x, re: new RegExp(x.re, 'g'), key: gramKeyOf(x.name) });
+        let posReq = null;
+        cores.forEach(function (v) { if (!posReq && POS_REQUIRED[v]) posReq = POS_REQUIRED[v]; });
+        matchers.push({ card: null, extra: x, re: new RegExp(x.re, 'g'), key: gramKeyOf(x.name), posRequired: posReq });
       } catch (e) { }
     });
 
@@ -286,8 +478,10 @@
         if (re.lastIndex === mt.index) re.lastIndex++;
         if (!mt[0]) continue;
         const start = mt.index, end = start + mt[0].length;
-        /* 单假名短语法词边界约束 */
-        if (re._boundary && !boundaryOK(text, start, end)) continue;
+        /* 词边界约束（单假名 / 两假名短核心 / 单汉字） */
+        if (!boundaryOK(text, start, end, re)) continue;
+        /* 常见词排除：できる 不当 ～きる、かなり 不当 ～なり … */
+        if (lexicalBlocked(text, start, end)) continue;
         /* 第一层（语法点层面）去重：同一语法点同一区间只保留一个 */
         const dk = m.key + '#' + start + '-' + end;
         if (seen[dk]) continue;
@@ -300,7 +494,9 @@
         if (m.card) pri += 1;
         hits.push({
           start: start, end: end, surface: mt[0],
-          card: m.card, extra: m.extra, key: m.key, pri: pri
+          card: m.card, extra: m.extra, key: m.key, pri: pri,
+          suffixOK: m.card ? isSuffixGrammar(m.card.name) : false,
+          posRequired: m.posRequired || null
         });
       }
     });
@@ -326,9 +522,12 @@
       accepted.push(h);                    // 与已接受区间不重叠 → 直接接受
     });
 
+    /* ---- 词性过滤（kuromoji 就绪时启用）：剔除戳进名词/动词内部的误判 ---- */
+    const finalHits = posFilterHits(text, accepted);
+
     /* 汇总语法点（按出现次数降序）；同一身份键只出一个点，有卡片时以卡片为代表 */
     const pmap = {};
-    accepted.forEach(function (h) {
+    finalHits.forEach(function (h) {
       let p = pmap[h.key];
       if (!p) {
         p = pmap[h.key] = {
@@ -347,7 +546,7 @@
     const points = Object.keys(pmap).map(function (k) { return pmap[k]; })
       .sort(function (a, b) { return b.count - a.count || (a.name < b.name ? -1 : 1); });
 
-    return { hits: accepted, points: points };
+    return { hits: finalHits, points: points };
   }
 
   /* ================= 难度判定 =================
@@ -585,6 +784,20 @@
       aiPreview = null;
     }
     closePop();
+
+    /* 首次进入精读页时懒加载分词器；词典就绪后若当前 hits 有变化则自动刷新 */
+    if (typeof kuromoji !== 'undefined' && !posReady() && !posFailed) {
+      ensureTokenizer(function (ok) {
+        if (!ok) return;
+        const fresh = analyze(a.text);
+        if (fresh.points.length !== current.analysis.points.length ||
+            fresh.hits.length !== current.analysis.hits.length) {
+          current.analysis = fresh;
+          renderDetail(id);
+        }
+      });
+    }
+
     const analysis = analyze(a.text);
     current = { article: a, analysis: analysis };
 
@@ -603,8 +816,16 @@
       let body;
       if (p.card) {
         const c = p.card;
+        const subChips = (Array.isArray(c.subPoints) && c.subPoints.length)
+          ? '<div class="pt-sec-t">🔖 用法</div><div class="pt-subs">' +
+          c.subPoints.map(function (sp) {
+            return '<a class="pt-sub-chip" href="#/card/' + encodeURIComponent(c.name) + '">' +
+              B.esc(sp.title) + '</a>';
+          }).join('') + '</div>'
+          : '';
         body =
           '<div class="pt-sec-t">📌 摘要</div><div class="pt-sec-b">' + B.esc(c.summary || '暂无') + '</div>' +
+          subChips +
           (c.lecture ? '<div class="pt-sec-t">📖 讲解</div><div class="pt-sec-b">' + B.esc(c.lecture) + '</div>' : '') +
           (c.examples && c.examples.length ?
             '<div class="pt-sec-t">💬 例句</div>' +
@@ -944,6 +1165,8 @@
     renderNew: renderNew,
     renderDetail: renderDetail,
     analyze: analyze,
-    assessDifficulty: assessDifficulty
+    assessDifficulty: assessDifficulty,
+    ensureTokenizer: ensureTokenizer,
+    posReady: posReady
   };
 })();
