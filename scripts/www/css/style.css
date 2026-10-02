@@ -2479,8 +2479,13 @@ input[type="file"]::file-selector-button {
 }
 
 @keyframes modal-fade {
-  from { opacity: 0; }
-  to { opacity: 1; }
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
 }
 
 .modal-panel {
@@ -2497,8 +2502,15 @@ input[type="file"]::file-selector-button {
 }
 
 @keyframes modal-pop {
-  from { transform: translateY(14px) scale(.98); opacity: 0; }
-  to { transform: translateY(0) scale(1); opacity: 1; }
+  from {
+    transform: translateY(14px) scale(.98);
+    opacity: 0;
+  }
+
+  to {
+    transform: translateY(0) scale(1);
+    opacity: 1;
+  }
 }
 
 .modal-head {
@@ -2650,6 +2662,96 @@ input[type="file"]::file-selector-button {
   box-shadow: 0 4px 12px rgba(229, 72, 77, .28);
 }
 
+/* 章节页操作条：练习 + 一键删除并排，窄屏换行 */
+.ch-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.ch-actions .btn {
+  flex: 1 1 auto;
+  margin-bottom: 0;
+}
+
+/* ========== 卡片详情：子考点（用法）横向标签栏 ========== */
+.sub-tabs {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 2px 2px 10px;
+  margin: 12px 0 4px;
+  scrollbar-width: none;
+}
+
+.sub-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.sub-tab {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #e3dcc9;
+  background: #faf6ea;
+  color: #6b5d3f;
+  border-radius: 999px;
+  padding: 7px 14px;
+  font-size: 13.5px;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all .15s;
+}
+
+.sub-tab em {
+  font-style: normal;
+  font-size: 11.5px;
+  background: rgba(0, 0, 0, .06);
+  border-radius: 999px;
+  padding: 2px 7px;
+}
+
+.sub-tab.active {
+  background: linear-gradient(135deg, var(--ink, #2b3a55), #3b4f74);
+  border-color: transparent;
+  color: #fff;
+  box-shadow: 0 3px 10px rgba(43, 58, 85, .25);
+}
+
+.sub-tab.active em {
+  background: rgba(255, 255, 255, .22);
+}
+
+.badge.sub-count,
+.badge.sub-badge {
+  background: #eef3ff;
+  color: #3b5bbf;
+}
+
+.sub-detail {
+  margin-top: 10px;
+}
+
+/* 精读弹层里的用法小标签 */
+.pt-subs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.pt-sub-chip {
+  font-size: 12px;
+  background: #eef3ff;
+  color: #3b5bbf;
+  border-radius: 999px;
+  padding: 3px 10px;
+}
+
 .btn-outline-danger {
   border: 1px solid #f0b4b6;
   background: #fff;
@@ -2771,7 +2873,7 @@ input[type="file"]::file-selector-button {
   border-top: 1px solid var(--border);
 }
 
-.batch-move-wrap > label {
+.batch-move-wrap>label {
   display: block;
   font-size: 13px;
   font-weight: 700;
@@ -2835,18 +2937,18 @@ input[type="file"]::file-selector-button {
   overflow: hidden;
 }
 
-.src-item > summary {
+.src-item>summary {
   list-style: none;
   cursor: pointer;
   padding: 11px 14px;
   user-select: none;
 }
 
-.src-item > summary::-webkit-details-marker {
+.src-item>summary::-webkit-details-marker {
   display: none;
 }
 
-.src-item[open] > summary {
+.src-item[open]>summary {
   border-bottom: 1px solid var(--border);
   background: #fff;
 }
@@ -2885,7 +2987,7 @@ input[type="file"]::file-selector-button {
   padding: 12px 14px 14px;
 }
 
-.si-body .detail-block + .detail-block {
+.si-body .detail-block+.detail-block {
   margin-top: 12px;
 }
 
@@ -3105,6 +3207,40 @@ input[type="file"]::file-selector-button {
 
 .rc-q-hint {
   font-size: 11.5px;
+  color: var(--muted);
+}
+
+/* 正文外附加题的题干 */
+.rc-q-stem {
+  font-size: 14.5px;
+  line-height: 1.7;
+  color: #26282e;
+  background: rgba(122, 126, 240, .07);
+  border-left: 3px solid #7a7ef0;
+  border-radius: 0 8px 8px 0;
+  padding: 8px 12px;
+  margin: -2px 0 10px;
+}
+
+/* 附加题分区标题 */
+.rc-extra-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 22px 0 12px;
+  padding-top: 16px;
+  border-top: 1.5px dashed var(--border);
+}
+
+.rc-extra-t {
+  font-size: 15.5px;
+  font-weight: 700;
+  color: #5a63d8;
+}
+
+.rc-extra-sub {
+  font-size: 12px;
   color: var(--muted);
 }
 
@@ -3565,7 +3701,7 @@ input[type="file"]::file-selector-button {
   overflow: hidden;
 }
 
-.scp-bar > i {
+.scp-bar>i {
   display: block;
   height: 100%;
   border-radius: 99px;
@@ -3582,9 +3718,17 @@ input[type="file"]::file-selector-button {
   font-size: 11.5px;
 }
 
-.scp-txt .fresh { color: #9aa0ab; }
-.scp-txt .half { color: #d98a1f; }
-.scp-txt .done { color: #1f9d63; }
+.scp-txt .fresh {
+  color: #9aa0ab;
+}
+
+.scp-txt .half {
+  color: #d98a1f;
+}
+
+.scp-txt .done {
+  color: #1f9d63;
+}
 
 .scp-txt em {
   font-style: normal;
@@ -3605,7 +3749,7 @@ details.sb-more {
   z-index: 20;
 }
 
-details.sb-more > summary {
+details.sb-more>summary {
   list-style: none;
   width: 30px;
   height: 30px;
@@ -3621,7 +3765,7 @@ details.sb-more > summary {
   user-select: none;
 }
 
-details.sb-more > summary::-webkit-details-marker {
+details.sb-more>summary::-webkit-details-marker {
   display: none;
 }
 
@@ -3634,14 +3778,14 @@ details.sb-more[open] {
   padding: 4px;
 }
 
-details.sb-more[open] > summary {
+details.sb-more[open]>summary {
   width: 100%;
   justify-content: center;
   background: var(--primary-light);
   color: var(--primary-dark);
 }
 
-details.sb-more > .btn-mini {
+details.sb-more>.btn-mini {
   display: block;
   width: 100%;
   margin-top: 4px;
@@ -3662,7 +3806,7 @@ details.dc-more {
   flex: none;
 }
 
-details.dc-more > summary {
+details.dc-more>summary {
   list-style: none;
   width: 34px;
   height: 34px;
@@ -3678,11 +3822,11 @@ details.dc-more > summary {
   user-select: none;
 }
 
-details.dc-more > summary::-webkit-details-marker {
+details.dc-more>summary::-webkit-details-marker {
   display: none;
 }
 
-details.dc-more[open] > summary {
+details.dc-more[open]>summary {
   background: var(--primary-light);
   color: var(--primary-dark);
 }
@@ -3847,7 +3991,7 @@ details.dc-more[open] > summary {
     gap: 10px;
   }
 
-  .sg-row > span {
+  .sg-row>span {
     min-width: 0;
   }
 
@@ -3860,4 +4004,200 @@ details.dc-more[open] > summary {
   .scp-empty {
     margin-left: 27px;
   }
+}
+
+/* ============================================================
+   v6.2 综合练习：答题进度保存（断点续练）
+   ============================================================ */
+
+/* 章节 / 未分类练习行：名称行 + 进度行 纵向排列 */
+.pr-chapter .pr-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.pr-chapter .pr-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.pr-chapter .pr-line .sc-name {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.pr-chapter .pr-line .sc-count {
+  flex: none;
+}
+
+/* 行内进度条（复用书架 .scp-bar 的蓝紫渐变） */
+.pr-prog {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 5px;
+}
+
+.pr-prog .scp-bar {
+  flex: 1 1 auto;
+  min-width: 60px;
+}
+
+.pr-prog-txt {
+  flex: none;
+  font-size: 11.5px;
+  color: #5a63d8;
+  white-space: nowrap;
+}
+
+.pr-go {
+  flex: none;
+  color: #c6c6cc;
+  font-size: 12px;
+}
+
+.pr-chapter.has-draft {
+  background: linear-gradient(90deg, rgba(122, 126, 240, .08), rgba(90, 99, 216, 0) 62%);
+}
+
+.pr-chapter.has-draft .pr-go {
+  color: #5a63d8;
+  font-weight: 600;
+}
+
+/* 圆形小「✕」：清除已保存进度 */
+.pr-clear {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: #f0f1f6;
+  color: #8a8f9c;
+  font-size: 12px;
+  line-height: 24px;
+  text-align: center;
+  cursor: pointer;
+}
+
+.pr-clear:active {
+  background: #e2e4ee;
+}
+
+.pr-clear.lg {
+  width: 42px;
+  height: 42px;
+  font-size: 15px;
+  line-height: 42px;
+}
+
+/* 练整本「继续 x/y」蓝紫实心按钮 */
+.btn-mini.pr-resume {
+  background: linear-gradient(90deg, #7a7ef0, #5a63d8);
+  border-color: transparent;
+  color: #fff;
+}
+
+.pr-book .sb-btns {
+  align-items: center;
+}
+
+/* 随机练习：续练主按钮 + 清除同一行 */
+.pr-main-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.pr-main-row .shelf-new-btn {
+  flex: 1 1 auto;
+  margin-bottom: 0;
+}
+
+@media (max-width: 480px) {
+  .pr-prog-txt {
+    font-size: 11px;
+  }
+}
+
+/* ========== 语法卡片列表模糊搜索（首页 / 章节页 / 导入管理共用） ========== */
+.search-zone {
+  margin-bottom: 18px;
+}
+
+.search-bar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.search-bar .sb-ico {
+  position: absolute;
+  left: 14px;
+  font-size: 14px;
+  opacity: .55;
+  pointer-events: none;
+}
+
+.card-search-input {
+  width: 100%;
+  padding: 11px 40px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--card);
+  font-size: 15px;
+  color: var(--text);
+  box-shadow: var(--shadow);
+  outline: none;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.card-search-input:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, .15);
+}
+
+/* 隐藏原生搜索框清除按钮，用自定义 ✕（可点击清空并回焦） */
+.card-search-input::-webkit-search-cancel-button,
+.card-search-input::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.search-clear {
+  position: absolute;
+  right: 9px;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 50%;
+  background: var(--border);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.search-clear:active {
+  background: #d8dae0;
+}
+
+.search-empty {
+  padding: 28px 12px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+/* 作者样式的 display 会盖过浏览器原生 [hidden]{display:none}，搜索过滤需强制隐藏 */
+.search-zone [hidden] {
+  display: none !important;
 }
