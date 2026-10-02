@@ -33,7 +33,10 @@ const Store = {
     bombLabels: 'jp_bomblabels_v1',
     bombProgress: 'jp_bombprogress_v1',
     books: 'jp_books_v1',
-    reading: 'jp_reading_v1'
+    reading: 'jp_reading_v1',
+    practiceDrafts: 'jp_practice_drafts_v1',
+    practiceActive: 'jp_practice_active_v1',
+    learnMode: 'jp_learn_mode'
   },
 
   _read(key, fallback) {
@@ -292,6 +295,8 @@ const Store = {
       answer: 'ABCD'.includes(question.answer) ? question.answer : 'A',
       explanation: question.explanation || '',
       difficulty: question.difficulty || '中',
+      /* 所属子考点（用法）标题；'' 表示不区分用法 / 旧题目 */
+      subPoint: question.subPoint ? String(question.subPoint) : '',
       bookId: bookId,
       chapterId: chapterId
     };
@@ -399,10 +404,58 @@ const Store = {
     };
   },
 
+  /** 归一化单个子考点（同一卡片内按标题去重，保留先出现的一条） */
+  _makeSubPoint(s) {
+    s = s && typeof s === 'object' ? s : {};
+    const examples = (Array.isArray(s.examples) ? s.examples : [])
+      .filter(e => e && e.jp)
+      .map(e => ({ jp: String(e.jp), cn: e.cn ? String(e.cn) : '' }));
+    return {
+      id: s.id || this.uid('sp'),
+      title: String(s.title || '').trim(),
+      lecture: s.lecture || '',
+      emphasis: s.emphasis || '',
+      examples: examples
+    };
+  },
+
+  /** 归一化卡片的子考点列表：丢弃无标题项，按标题去重 */
+  _normSubPoints(list) {
+    const seen = new Set();
+    const out = [];
+    (Array.isArray(list) ? list : []).forEach(x => {
+      const sp = this._makeSubPoint(x);
+      if (!sp.title || seen.has(sp.title)) return;
+      seen.add(sp.title);
+      out.push(sp);
+    });
+    return out;
+  },
+
+  /** 把子考点合并进已有卡片：新标题追加，同标题更新讲解/合并例句（跨来源共享） */
+  _mergeSubPoints(card, incoming) {
+    if (!Array.isArray(incoming) || !incoming.length) return;
+    if (!Array.isArray(card.subPoints)) card.subPoints = [];
+    incoming.forEach(raw => {
+      const sp = this._makeSubPoint(raw);
+      if (!sp.title) return;
+      const i = card.subPoints.findIndex(x => x.title === sp.title);
+      if (i === -1) { card.subPoints.push(sp); return; }
+      const old = card.subPoints[i];
+      if (sp.lecture) old.lecture = sp.lecture;
+      if (sp.emphasis) old.emphasis = sp.emphasis;
+      sp.examples.forEach(ex => {
+        if (!old.examples.some(e => e.jp === ex.jp)) old.examples.push(ex);
+      });
+    });
+  },
+
   /** 归一化整张卡片，返回 { card, changed } */
   _normalizeCard(card) {
     const c = { ...(card || {}) };
     let changed = false;
+    /* questions 只存在导入预览里，不允许落进卡片记录 */
+    if (Object.prototype.hasOwnProperty.call(c, 'questions')) { delete c.questions; changed = true; }
 
     let sources;
     if (Array.isArray(c.sources) && c.sources.length) {
@@ -436,6 +489,11 @@ const Store = {
     c.bookId = p.bookId;
     c.chapterId = p.chapterId;
     c.examples = p.examples.map(e => ({ ...e }));
+
+    /* 子考点：跨来源共享的用法列表，归一化并按标题去重 */
+    const subPoints = this._normSubPoints(c.subPoints);
+    if (JSON.stringify(c.subPoints || []) !== JSON.stringify(subPoints)) changed = true;
+    c.subPoints = subPoints;
     return { card: c, changed: changed };
   },
 
@@ -460,6 +518,7 @@ const Store = {
     qs.forEach(q => {
       if (q.bookId === undefined || q.bookId === null) { q.bookId = ''; qChanged = true; }
       if (q.chapterId === undefined || q.chapterId === null) { q.chapterId = ''; qChanged = true; }
+      if (q.subPoint === undefined || q.subPoint === null) { q.subPoint = ''; qChanged = true; }
     });
     if (qChanged) this.saveQuestions(qs);
     return { cards: cardChanged ? 1 : 0, questions: qChanged ? 1 : 0 };
@@ -565,7 +624,8 @@ const Store = {
           ...item,
           id: item.id || this.uid('c'),
           category: item.category || '自定义语法',
-          sources: incoming
+          sources: incoming,
+          subPoints: this._normSubPoints(item.subPoints)
         });
         result.added++;
         return;
@@ -584,6 +644,8 @@ const Store = {
           result.updated++;
         }
       });
+      /* 子考点是跨来源共享的用法列表：新标题追加，同标题更新 */
+      this._mergeSubPoints(card, item.subPoints);
     });
     this.saveCards(list);
     return result;
@@ -958,8 +1020,10 @@ const Store = {
    *      articles: [{ id, title, text(挖空为（1）（2）…), createdAt, favorite,
    *        blanks: [{ no, options:{A,B,C,D}, answer, explanation, points:[],
    *                   qid(答错时同步进题库的题id), lastWrong }],
+   *        extras(正文外的附加题，可空): [{ no, stem, options, answer, explanation,
+   *                   points:[], qid, lastWrong }],
    *        precisionId(已导入精读的 articleId),
-   *        state: { chosen:{no:letter}, submitted, correct, total,
+   *        state: { chosen:{no:letter 或 'x'+no:letter}, submitted, correct, total,
    *                 updatedAt, history:[{ts,correct,total}] } }] }] }] */
   getReadingBooks() {
     return this._read(this.KEYS.reading, []);
@@ -1007,13 +1071,79 @@ const Store = {
     return true;
   },
 
-  /** 收集文章已同步进题库的题 id（级联删除用） */
+  /** 收集文章已同步进题库的题 id（挖空题 + 附加题，级联删除用） */
   _readingQids(articles) {
     const ids = [];
-    (articles || []).forEach(a => (a.blanks || []).forEach(b => {
-      if (b.qid) ids.push(b.qid);
-    }));
+    (articles || []).forEach(a => {
+      (a.blanks || []).forEach(b => { if (b.qid) ids.push(b.qid); });
+      (a.extras || []).forEach(q => { if (q.qid) ids.push(q.qid); });
+    });
     return ids;
+  },
+
+  /**
+   * 备份合并：阅读理解书架（书籍 → 单元 → 文章）按 id 三级归并。
+   * - 书 / 单元不存在则整体新增；
+   * - 同 id 文章：保留作答进度更新（state.updatedAt 更大）的一份；
+   * - lastStudyAt 取较新者。
+   * @returns {{books:number, units:number, articles:number}} 新增计数
+   */
+  mergeReadingBooks(incoming) {
+    const added = { books: 0, units: 0, articles: 0 };
+    if (!Array.isArray(incoming) || !incoming.length) return added;
+    const books = this.getReadingBooks();
+    const bookIndex = new Map(books.map(b => [b.id, b]));
+
+    incoming.forEach(ib => {
+      if (!ib || !ib.id) return;
+      let b = bookIndex.get(ib.id);
+      if (!b) {
+        b = {
+          id: ib.id, name: ib.name || '未命名书籍',
+          createdAt: ib.createdAt || Date.now(),
+          lastStudyAt: ib.lastStudyAt || 0, units: []
+        };
+        books.push(b);
+        bookIndex.set(b.id, b);
+        added.books++;
+      }
+      b.lastStudyAt = Math.max(b.lastStudyAt || 0, ib.lastStudyAt || 0);
+      if (!Array.isArray(b.units)) b.units = [];
+      const unitIndex = new Map(b.units.map(u => [u.id, u]));
+
+      (Array.isArray(ib.units) ? ib.units : []).forEach(iu => {
+        if (!iu || !iu.id) return;
+        let u = unitIndex.get(iu.id);
+        if (!u) {
+          u = { id: iu.id, name: iu.name || '未命名单元', createdAt: iu.createdAt || Date.now(), articles: [] };
+          b.units.push(u);
+          unitIndex.set(u.id, u);
+          added.units++;
+        }
+        if (!Array.isArray(u.articles)) u.articles = [];
+        const artIndex = new Map(u.articles.map(a => [a.id, a]));
+        (Array.isArray(iu.articles) ? iu.articles : []).forEach(ia => {
+          if (!ia || !ia.id) return;
+          const ex = artIndex.get(ia.id);
+          if (!ex) {
+            u.articles.push(ia);
+            artIndex.set(ia.id, ia);
+            added.articles++;
+          } else {
+            /* 同 id：谁的作答进度更新就用谁（未作答的回退到创建时间） */
+            const t1 = (ex.state && ex.state.updatedAt) || ex.createdAt || 0;
+            const t2 = (ia.state && ia.state.updatedAt) || ia.createdAt || 0;
+            if (t2 > t1) {
+              const pos = u.articles.indexOf(ex);
+              u.articles[pos] = ia;
+              artIndex.set(ia.id, ia);
+            }
+          }
+        });
+      });
+    });
+    this.saveReadingBooks(books);
+    return added;
   },
 
   deleteReadingBook(id) {
@@ -1458,6 +1588,90 @@ const Store = {
     return { questions: removedIds.size, cards: cardsAffected };
   },
 
+  /* ---------------- 综合练习：答题进度（断点续练） ----------------
+   * jp_practice_drafts_v1:
+   *   { [scopeKey]: {
+   *       key, mode, title, pointName, articleId, sourceBookId,
+   *       bookId, chapterId, feedback, learnMode, index, updatedAt,
+   *       items: [{ qid, perm, chosen, ms, uncertain }] } }
+   * scopeKey 约定：
+   *   mixed                     随机练习全部
+   *   uncat                     未分类题目
+   *   book:<bookId>             练整本
+   *   ch:<bookId>:<chapterId>   章节练习（chapterId 为空串=本书未分章节）
+   * jp_practice_active_v1：最近打开的 scopeKey，刷新停在 #/quiz 时直接恢复 */
+  getPracticeDrafts() {
+    return this._read(this.KEYS.practiceDrafts, {});
+  },
+
+  /** 写入一份进度；最多保留 20 份，最久未动的先淘汰 */
+  savePracticeDraft(key, draft) {
+    if (!key || !draft) return;
+    const map = this.getPracticeDrafts();
+    map[key] = draft;
+    const oldest = Object.keys(map).sort((a, b) =>
+      (map[a].updatedAt || 0) - (map[b].updatedAt || 0));
+    while (oldest.length > 20) delete map[oldest.shift()];
+    this._write(this.KEYS.practiceDrafts, map);
+  },
+
+  getPracticeDraft(key) {
+    return key ? (this.getPracticeDrafts()[key] || null) : null;
+  },
+
+  deletePracticeDraft(key) {
+    if (!key) return;
+    const map = this.getPracticeDrafts();
+    if (!map[key]) return;
+    delete map[key];
+    this._write(this.KEYS.practiceDrafts, map);
+  },
+
+  getActivePracticeKey() {
+    try { return localStorage.getItem(this.KEYS.practiceActive) || ''; }
+    catch (e) { return ''; }
+  },
+
+  setActivePracticeKey(key) {
+    try { localStorage.setItem(this.KEYS.practiceActive, key || ''); } catch (e) { }
+  },
+
+  /** 不传 key 清空任意活跃指针；传 key 时只在匹配时清，避免误清别的练习 */
+  clearActivePracticeKey(key) {
+    try {
+      if (!key || localStorage.getItem(this.KEYS.practiceActive) === key) {
+        localStorage.removeItem(this.KEYS.practiceActive);
+      }
+    } catch (e) { }
+  },
+
+  /**
+   * 用当前题库校验全部进度：剔除已删除的题目；
+   * 题目被删光（整章/整书删除）的进度直接移除。返回校验后的 map。
+   */
+  prunePracticeDrafts() {
+    const map = this.getPracticeDrafts();
+    const alive = new Set(this.getQuestions().map(q => q.id));
+    let changed = false;
+    Object.keys(map).forEach(key => {
+      const d = map[key];
+      const oldItems = Array.isArray(d.items) ? d.items : [];
+      const items = oldItems.filter(it => it && alive.has(it.qid));
+      if (items.length !== oldItems.length) changed = true;
+      if (!items.length) { delete map[key]; changed = true; return; }
+      d.items = items;
+      if (typeof d.index !== 'number' || d.index >= items.length) {
+        d.index = items.length - 1;
+        changed = true;
+      }
+    });
+    if (changed) {
+      this._write(this.KEYS.practiceDrafts, map);
+      if (!map[this.getActivePracticeKey()]) this.clearActivePracticeKey();
+    }
+    return map;
+  },
+
   /**
    * 校正悬空归属：bookId/章节不存在时降级为未分类/未分章节。
    * 用于外部备份合并后保证书架数据一致。
@@ -1504,11 +1718,13 @@ const Store = {
 
   /* ---------------- JSON 导出 / 导入 ---------------- */
 
-  /** 导出全部数据为可迁移对象 */
+  /** 导出全部数据为可迁移对象（题库 / 卡片 / 精读文章 / 阅读书架 / 游戏进度 / 偏好，一键全量） */
   exportBundle() {
+    let learnMode = '';
+    try { learnMode = localStorage.getItem(this.KEYS.learnMode) || ''; } catch (e) { }
     return {
       app: 'jp-grammar-quiz',
-      version: 2,
+      version: 3,
       exportedAt: new Date().toISOString(),
       questions: this.getQuestions(),
       cards: this.getCards(),
@@ -1516,12 +1732,16 @@ const Store = {
       wrongIds: this.getWrongIds(),
       markedIds: this.getMarkedIds(),
       pointMeta: this.getPointMeta(),
-      articles: this.getArticles(),
+      articles: this.getArticles(),          // 文章精读
       boss: this.getBossProgress(),
       bombLog: this.getBombLog(),
       bombCustom: this.getBombCustom(),
+      bombLabels: this.getBombLabels(),
       bombProgress: this.getBombProgress(),
-      books: this.getBooks()
+      books: this.getBooks(),                // 语法练习书架
+      reading: this.getReadingBooks(),       // 阅读理解书架（书籍 → 单元 → 文章）
+      practiceDrafts: this.getPracticeDrafts(), // 综合练习断点进度
+      prefs: { learnMode }                   // 学习 / 训练模式偏好
     };
   },
 
@@ -1539,7 +1759,8 @@ const Store = {
     const result = {
       questions: 0, questionsDup: 0,
       cardsAdded: 0, cardsAppended: 0, cardsUpdated: 0,
-      replaced: false
+      replaced: false,
+      reading: { books: 0, units: 0, articles: 0 }
     };
 
     if (mode === 'replace') {
@@ -1554,11 +1775,25 @@ const Store = {
       this._write(this.KEYS.bombLog, isArr(bundle.bombLog) ? bundle.bombLog : []);
       this._write(this.KEYS.bombCustom, isArr(bundle.bombCustom) ? bundle.bombCustom : []);
       this._write(this.KEYS.bombProgress, bundle.bombProgress && typeof bundle.bombProgress === 'object' ? bundle.bombProgress : {});
+      this.saveBombLabels(bundle.bombLabels && typeof bundle.bombLabels === 'object' ? bundle.bombLabels : {});
       this.saveBooks(isArr(bundle.books) ? bundle.books : []);
+      this.saveReadingBooks(isArr(bundle.reading) ? bundle.reading : []);
+      this._write(this.KEYS.practiceDrafts,
+        bundle.practiceDrafts && typeof bundle.practiceDrafts === 'object' ? bundle.practiceDrafts : {});
+      /* 覆盖后不自动续练备份里的会话，只保留可手动继续的进度草稿 */
+      this.clearActivePracticeKey();
+      if (bundle.prefs && bundle.prefs.learnMode) {
+        try { localStorage.setItem(this.KEYS.learnMode, bundle.prefs.learnMode); } catch (e) { }
+      }
       /* 旧版备份：卡片补 sources、题目补 bookId/chapterId，再修悬空归属 */
       this.migrateSources();
       this.reconcileScopes();
+      /* 进度草稿按还原后的题库校验，剔除悬空题目 */
+      this.prunePracticeDrafts();
       result.questions = bundle.questions.length;
+      result.reading.articles = (isArr(bundle.reading) ? bundle.reading : [])
+        .reduce((n, b) => n + (isArr(b.units)
+          ? b.units.reduce((m, u) => m + (isArr(u.articles) ? u.articles.length : 0), 0) : 0), 0);
       result.replaced = true;
       return result;
     }
@@ -1708,9 +1943,35 @@ const Store = {
       });
       this.saveBooks(books);
     }
-    /* 旧备份题目补归属、卡片补 sources，然后统一修悬空归属 */
+    // 阅读理解书架：书籍 → 单元 → 文章按 id 三级归并（同 id 文章保留进度更新的一份）
+    if (isArr(bundle.reading) && bundle.reading.length) {
+      result.reading = this.mergeReadingBooks(bundle.reading);
+    }
+    // 拆弹自定义细分标签：各大类下只追加本机没有的标签
+    if (bundle.bombLabels && typeof bundle.bombLabels === 'object') {
+      result.bombLabelsAdded = this.mergeBombLabels(bundle.bombLabels);
+    }
+    // 综合练习断点进度：按练习范围键取并集（本机已有进度不被覆盖）
+    if (bundle.practiceDrafts && typeof bundle.practiceDrafts === 'object') {
+      const dm = this.getPracticeDrafts();
+      Object.keys(bundle.practiceDrafts).forEach(k => {
+        if (!dm[k]) dm[k] = bundle.practiceDrafts[k];
+      });
+      this._write(this.KEYS.practiceDrafts, dm);
+    }
+    // 学习/训练模式偏好：本机没设置过时才沿用备份
+    if (bundle.prefs && bundle.prefs.learnMode) {
+      try {
+        if (!localStorage.getItem(this.KEYS.learnMode)) {
+          localStorage.setItem(this.KEYS.learnMode, bundle.prefs.learnMode);
+        }
+      } catch (e) { }
+    }
+    /* 旧备份题目补归属、卡片补 sources，然后统一修悬空归属；
+       进度草稿按合并后的题库校验，剔除引用已删题目的残留 */
     this.migrateSources();
     this.reconcileScopes();
+    this.prunePracticeDrafts();
     return result;
   },
 
