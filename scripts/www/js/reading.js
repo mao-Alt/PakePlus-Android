@@ -48,12 +48,38 @@
     return s;
   }
 
+  /* 题目统一视图：挖空题 key=no；正文外附加题 key='x'+no（避免编号冲突） */
+  function qKey(kind, no) { return kind === 'extra' ? 'x' + no : String(no); }
+
+  function allQs(a) {
+    const list = [];
+    (a.blanks || []).forEach(b => list.push({ kind: 'blank', key: String(b.no), q: b }));
+    (a.extras || []).forEach(q => list.push({ kind: 'extra', key: 'x' + q.no, q }));
+    return list;
+  }
+
+  function findQ(a, kind, no) {
+    const arr = kind === 'extra' ? (a.extras || []) : (a.blanks || []);
+    return arr.find(x => x.no === no) || null;
+  }
+
+  /** 一篇文章的总题数（挖空 + 附加题） */
+  function qTotal(a) {
+    return (a.blanks || []).length + ((a.extras || []).length);
+  }
+
+  /** 已作答数（只统计当前仍存在的题，防止删改后的残留 key） */
+  function qAnswered(a, s) {
+    s = s || normState(a);
+    return allQs(a).reduce((n, x) => n + (s.chosen[x.key] ? 1 : 0), 0);
+  }
+
   /** 文章状态：none 未做 / progress 作答中 / done 已做 / wrong 有错题 */
   function artStatus(a) {
     const s = normState(a);
-    const total = (a.blanks || []).length;
+    const total = qTotal(a);
     if (s.submitted) return s.correct >= total ? 'done' : 'wrong';
-    return Object.keys(s.chosen).length ? 'progress' : 'none';
+    return qAnswered(a, s) ? 'progress' : 'none';
   }
 
   function statusBadge(a) {
@@ -62,8 +88,8 @@
     if (st === 'done') return '<span class="badge done">✓ 已做</span>';
     if (st === 'wrong') return '<span class="badge warn">有错题</span>';
     if (st === 'progress') {
-      return '<span class="badge todo">作答中 ' + Object.keys(s.chosen).length +
-        '/' + (a.blanks || []).length + '</span>';
+      return '<span class="badge todo">作答中 ' + qAnswered(a, s) +
+        '/' + qTotal(a) + '</span>';
     }
     return '<span class="badge todo">未做</span>';
   }
@@ -71,7 +97,7 @@
   /** 已提交文章的正确率（%），未提交返回 null */
   function accuracyOf(a) {
     const s = normState(a);
-    const total = (a.blanks || []).length;
+    const total = qTotal(a);
     if (!s.submitted || !total) return null;
     return Math.round(s.correct / total * 100);
   }
@@ -81,7 +107,7 @@
     let done = 0, cor = 0, tot = 0;
     arts.forEach(a => {
       const s = normState(a);
-      if (s.submitted) { done++; cor += s.correct; tot += (a.blanks || []).length; }
+      if (s.submitted) { done++; cor += s.correct; tot += qTotal(a); }
     });
     return { count: arts.length, done, acc: tot ? Math.round(cor / tot * 100) : null };
   }
@@ -111,44 +137,49 @@
   }
 
   /**
-   * 把某个空同步成题库题（category 阅读理解、reading:true），返回题 id。
+   * 把某道题（挖空题 / 附加题）同步成题库题（category 阅读理解、reading:true），返回题 id。
    * 仅在答错或标记疑难时调用；题记录用于错题本/疑难队列展示与重练。
    */
-  function ensureQid(article, blank) {
-    if (blank.qid && Store.getQuestionById(blank.qid)) return blank.qid;
-    const stem = sentenceOf(article.text, blank.no)
-      .replace(new RegExp('[（(]\\s*' + blank.no + '\\s*[）)]'), '（　）');
-    const pts = (blank.points || []).join('・');
-    const q = {
+  function ensureQid(article, q, kind) {
+    if (q.qid && Store.getQuestionById(q.qid)) return q.qid;
+    let stem;
+    if (kind === 'extra') {
+      stem = q.stem || ('阅读理解附加题 ' + q.no + '（《' + article.title + '》）');
+    } else {
+      stem = sentenceOf(article.text, q.no)
+        .replace(new RegExp('[（(]\\s*' + q.no + '\\s*[）)]'), '（　）');
+    }
+    const pts = (q.points || []).join('・');
+    const rec = {
       id: Store.uid('rcq'),
       category: '阅读理解',
       point: '阅读理解·' + article.title,
       type: '单选题',
       stem,
-      options: blank.options,
-      answer: blank.answer,
-      explanation: (blank.explanation || '') + (pts ? (blank.explanation ? '　' : '') + '知识点：' + pts : ''),
+      options: q.options,
+      answer: q.answer,
+      explanation: (q.explanation || '') + (pts ? (q.explanation ? '　' : '') + '知识点：' + pts : ''),
       difficulty: '中',
       reading: true,
       rcArticleId: article.id,
-      rcBlankNo: blank.no
+      rcBlankNo: q.no
     };
-    Store.addQuestions([q]);
-    blank.qid = q.id;
-    return q.id;
+    Store.addQuestions([rec]);
+    q.qid = rec.id;
+    return rec.id;
   }
 
-  /** 判一个空：答错进错题本，答对则从错题本移除（若曾在） */
-  function gradeBlank(article, blank, bookId) {
+  /** 判一道题：答错进错题本，答对则从错题本移除（若曾在） */
+  function gradeQ(article, item, bookId) {
     const s = normState(article);
-    const chosen = s.chosen[blank.no];
-    const correct = chosen === blank.answer;
+    const chosen = s.chosen[item.key];
+    const correct = chosen === item.q.answer;
     if (!correct) {
-      Store.addWrong(ensureQid(article, blank));
-      blank.lastWrong = true;
-    } else if (blank.qid) {
-      Store.removeWrong(blank.qid);
-      blank.lastWrong = false;
+      Store.addWrong(ensureQid(article, item.q, item.kind));
+      item.q.lastWrong = true;
+    } else if (item.q.qid) {
+      Store.removeWrong(item.q.qid);
+      item.q.lastWrong = false;
     }
     if (bookId) Store.touchReadingBook(bookId);
     return correct;
@@ -157,11 +188,12 @@
   /** 全部答完则收尾：计分、写历史、置已提交 */
   function finalize(article, bookId) {
     const s = normState(article);
-    const total = (article.blanks || []).length;
-    const answered = Object.keys(s.chosen).length;
+    const items = allQs(article);
+    const total = items.length;
+    const answered = qAnswered(article, s);
     if (s.submitted || answered < total) return false;
     let cor = 0;
-    (article.blanks || []).forEach(b => { if (s.chosen[b.no] === b.answer) cor++; });
+    items.forEach(it => { if (s.chosen[it.key] === it.q.answer) cor++; });
     s.correct = cor;
     s.total = total;
     s.submitted = true;
@@ -212,12 +244,12 @@
         '</div></div></div>';
     }).join('') :
       '<div class="empty"><span class="e-ico">📚</span>' +
-      '<div class="e-txt">阅读理解书架还是空的<br>新建一本书，或直接导入带挖空的文章</div>' +
+      '<div class="e-txt">阅读理解书架还是空的<br>新建一本书，或直接导入文章（挖空题、附加题都支持）</div>' +
       '<button class="btn btn-primary" data-rc="new-book">＋ 新建书籍</button></div>';
 
     B().setHTML(
       '<header class="page-head"><h1>阅读理解</h1>' +
-      '<div class="sub">书籍 → 单元 → 挖空文章；答错自动进错题本，做完可一键精读</div></header>' +
+      '<div class="sub">书籍 → 单元 → 文章（挖空题 / 正文外附加题）；答错自动进错题本，做完可一键精读</div></header>' +
       '<div class="rc-toolbar">' +
       '<button class="btn btn-ink" data-rc="new-book">＋ 新建书籍</button>' +
       '<a class="btn btn-primary" href="#/reading/import">📥 导入文章</a>' +
@@ -303,14 +335,17 @@
 
     const rows = arts.map(a => {
       const acc = accuracyOf(a);
-      const hasExpl = (a.blanks || []).some(b => b.explanation);
+      const extraCount = (a.extras || []).length;
+      const hasExpl = (a.blanks || []).some(b => b.explanation) ||
+        (a.extras || []).some(q => q.explanation);
       return '<div class="art-item" data-rc="open-pass" data-id="' + esc(a.id) + '">' +
         '<div class="ai-main">' +
         '<div class="ai-title">' + (a.favorite ? '<span class="rc-fav">★</span> ' : '') +
         esc(a.title) + '</div>' +
         '<div class="ai-meta">' +
         statusBadge(a) +
-        '<span class="badge todo">' + (a.blanks || []).length + ' 空</span>' +
+        '<span class="badge todo">' + qTotal(a) + ' 题</span>' +
+        (extraCount ? '<span class="badge cat">附加题 ' + extraCount + '</span>' : '') +
         (acc !== null ? '<span class="badge ' + (acc >= 60 ? 'done' : 'warn') +
           '">正确率 ' + acc + '%</span>' : '') +
         (hasExpl ? '<span class="badge cat">有解析</span>' : '') +
@@ -326,6 +361,11 @@
       '<header class="page-head"><h1>' + esc(unit.name) + '</h1>' +
       '<div class="sub">' + st.count + ' 篇 · 已做 ' + st.done +
       (st.acc !== null ? ' · 单元正确率 ' + st.acc + '%' : '') + '</div></header>' +
+      '<div class="rc-toolbar">' +
+      '<a class="btn btn-primary" href="#/reading/import">📥 导入文章</a>' +
+      '<button class="btn btn-danger" data-rc="del-unit" data-book="' +
+      esc(bookId) + '" data-id="' + esc(unitId) + '">🗑 一键删除整个单元</button>' +
+      '</div>' +
       (rows || '<div class="empty"><span class="e-ico">📝</span>' +
         '<div class="e-txt">本单元还没有文章</div>' +
         '<a class="btn btn-primary" href="#/reading/import">📥 导入文章</a></div>')
@@ -353,11 +393,14 @@
     return escaped.replace(MARK_RE, (m, n) => blankSpan(a, Number(n)));
   }
 
-  function questionCard(a, b, markedIds) {
+  /** 统一题卡：item = { kind:'blank'|'extra', key, q } */
+  function questionCard(a, item, markedIds) {
+    const { kind, key, q: b } = item;
     const s = normState(a);
-    const chosen = s.chosen[b.no];
+    const chosen = s.chosen[key];
     const graded = (passMode === 'step' && !!chosen) || s.submitted;
     const locked = graded;
+    const isExtra = kind === 'extra';
 
     const opts = ['A', 'B', 'C', 'D'].map(L => {
       let cls = 'rc-opt';
@@ -367,8 +410,9 @@
         else if (chosen === L) cls += ' bad';
         else cls += ' dim';
       }
-      return '<button class="' + cls + '" data-rc="opt" data-no="' + b.no +
-        '" data-letter="' + L + '"' + (locked ? ' disabled' : '') + '>' +
+      return '<button class="' + cls + '" data-rc="opt" data-kind="' + kind +
+        '" data-no="' + b.no + '" data-letter="' + L + '"' +
+        (locked ? ' disabled' : '') + '>' +
         '<span class="rc-opt-l">' + L + '</span><span class="rc-opt-t">' +
         esc(b.options[L]) + '</span></button>';
     }).join('');
@@ -382,7 +426,7 @@
         (correct ? '✓ 回答正确' : '✗ 正确答案：' + b.answer + '．' + esc(b.options[b.answer])) +
         '</div>' +
         '<button class="btn-mini rc-mark' + (marked ? ' on' : '') +
-        '" data-rc="mark-blank" data-no="' + b.no + '">' +
+        '" data-rc="mark-blank" data-kind="' + kind + '" data-no="' + b.no + '">' +
         (marked ? '🚩 已标疑难' : '🚩 标记疑难') + '</button>' +
         ((b.explanation || (b.points || []).length) ?
           '<details class="rc-expl"' + (correct ? '' : ' open') + '><summary>查看解析</summary>' +
@@ -393,11 +437,16 @@
           '</details>' : '');
     }
 
+    const headLabel = isExtra ? ('附加题 ' + b.no) : ('第 ' + b.no + ' 空');
+    const headHint = isExtra
+      ? (graded && chosen ? '' : '<span class="rc-q-hint">正文之外的独立题</span>')
+      : (graded && chosen ? '' : '<span class="rc-q-hint">在上方原文中找到（' + b.no + '）</span>');
+
     return '<div class="rc-q' + (graded && chosen ?
       (chosen === b.answer ? ' ok' : ' bad') : '') + '">' +
-      '<div class="rc-q-head"><span class="rc-q-no">第 ' + b.no + ' 空</span>' +
-      (graded && chosen ? '' : '<span class="rc-q-hint">在上方原文中找到（' + b.no + '）</span>') +
-      '</div>' + opts + result + '</div>';
+      '<div class="rc-q-head"><span class="rc-q-no">' + headLabel + '</span>' + headHint + '</div>' +
+      (isExtra && b.stem ? '<div class="rc-q-stem">' + esc(b.stem) + '</div>' : '') +
+      opts + result + '</div>';
   }
 
   function renderPassage(id) {
@@ -411,8 +460,10 @@
     }
     const { book, unit, article: a } = hit;
     const s = normState(a);
-    const total = (a.blanks || []).length;
-    const answered = Object.keys(s.chosen).length;
+    const blankCount = (a.blanks || []).length;
+    const extraCount = (a.extras || []).length;
+    const total = qTotal(a);
+    const answered = qAnswered(a, s);
     const started = answered > 0;
     const markedIds = Store.getMarkedIds();
 
@@ -438,7 +489,7 @@
     const precision = a.precisionId && Store.getArticleById(a.precisionId);
     const precisionBtn = precision
       ? '<a class="btn btn-primary" href="#/article/' + encodeURIComponent(a.precisionId) +
-        '">📖 查看精读</a>'
+      '">📖 查看精读</a>'
       : '<button class="btn btn-primary" data-rc="to-precision">📖 一键导入到文章精读</button>';
 
     B().setHTML(
@@ -447,7 +498,9 @@
       '<header class="page-head"><h1>' + esc(a.title) + '</h1>' +
       '<div class="art-meta-row">' +
       '<span class="badge cat">' + esc(book.name) + ' · ' + esc(unit.name) + '</span>' +
-      '<span class="badge todo">' + total + ' 空</span>' +
+      '<span class="badge todo">' + total + ' 题</span>' +
+      (blankCount ? '<span class="badge todo">挖空 ' + blankCount + '</span>' : '') +
+      (extraCount ? '<span class="badge cat">附加题 ' + extraCount + '</span>' : '') +
       statusBadge(a) +
       (a.favorite ? '<span class="badge rc-fav-badge">★ 已收藏</span>' : '') +
       '</div></header>' +
@@ -468,9 +521,19 @@
 
       banner +
       '<div class="art-body rc-body">' + bodyHTML(a) + '</div>' +
-      '<div class="hl-hint">— 在下方选择每空的答案 —</div>' +
 
-      (a.blanks || []).map(b => questionCard(a, b, markedIds)).join('') +
+      (blankCount
+        ? '<div class="hl-hint">— 在下方选择每空的答案 —</div>' +
+        allQs(a).filter(x => x.kind === 'blank')
+          .map(item => questionCard(a, item, markedIds)).join('')
+        : '') +
+
+      (extraCount
+        ? '<div class="rc-extra-head"><span class="rc-extra-t">📝 附加题目</span>' +
+        '<span class="rc-extra-sub">正文之外的独立题（语法辨析・读音・阅读选择等）</span></div>' +
+        allQs(a).filter(x => x.kind === 'extra')
+          .map(item => questionCard(a, item, markedIds)).join('')
+        : '') +
 
       (passMode === 'exam' && !s.submitted ?
         '<button class="btn btn-ink rc-submit" data-rc="submit"' +
@@ -484,27 +547,29 @@
 
   /* ================= 作答动作 ================= */
 
-  function doOpt(no, letter) {
+  function doOpt(kind, no, letter) {
     const hit = locate();
     if (!hit) return;
     const { book, article: a } = hit;
     const s = normState(a);
     if (s.submitted) return;
-    const b = (a.blanks || []).find(x => x.no === no);
-    if (!b) return;
+    const q = findQ(a, kind, no);
+    if (!q) return;
+    const key = qKey(kind, no);
+    const item = { kind, key, q };
 
     if (passMode === 'step') {
-      if (s.chosen[no]) return;                 // 逐题模式：判过即锁定
-      s.chosen[no] = letter;
-      gradeBlank(a, b, book.id);
+      if (s.chosen[key]) return;                // 逐题模式：判过即锁定
+      s.chosen[key] = letter;
+      gradeQ(a, item, book.id);
       const done = finalize(a, book.id);
       Store.updateReadingArticle(a);
       B().refreshBadge();
       if (done) B().toast('已全部完成：' + s.correct + '/' + s.total +
         (s.correct < s.total ? '，错题已进错题本' : '，全对！'));
     } else {
-      s.chosen[no] = s.chosen[no] === letter ? undefined : letter;
-      if (!s.chosen[no]) delete s.chosen[no];
+      s.chosen[key] = s.chosen[key] === letter ? undefined : letter;
+      if (!s.chosen[key]) delete s.chosen[key];
       Store.updateReadingArticle(a);
     }
     refreshPassage();
@@ -515,13 +580,14 @@
     if (!hit) return;
     const { book, article: a } = hit;
     const s = normState(a);
-    const total = (a.blanks || []).length;
+    const items = allQs(a);
+    const total = items.length;
     if (s.submitted) return;
-    if (Object.keys(s.chosen).length < total) {
-      B().toast('还有 ' + (total - Object.keys(s.chosen).length) + ' 空未作答');
+    if (qAnswered(a, s) < total) {
+      B().toast('还有 ' + (total - qAnswered(a, s)) + ' 题未作答');
       return;
     }
-    (a.blanks || []).forEach(b => gradeBlank(a, b, book.id));
+    items.forEach(item => gradeQ(a, item, book.id));
     finalize(a, book.id);
     Store.updateReadingArticle(a);
     B().refreshBadge();
@@ -542,13 +608,13 @@
     refreshPassage();
   }
 
-  function doMarkBlank(no) {
+  function doMarkBlank(kind, no) {
     const hit = locate();
     if (!hit) return;
     const { article: a } = hit;
-    const b = (a.blanks || []).find(x => x.no === no);
+    const b = findQ(a, kind, no);
     if (!b) return;
-    const qid = ensureQid(a, b);
+    const qid = ensureQid(a, b, kind);
     if (Store.getMarkedIds().indexOf(qid) !== -1) {
       Store.removeMarked(qid);
       B().toast('已移出疑难队列');
@@ -598,18 +664,46 @@
   const FORMAT_HINT =
     '在上方「导入到哪个书籍 / 单元」直接选择已有的书籍和单元；也可以选「跟随文本」，由文中的【书名】【单元】自动归类（可一次批量导入多本多套）。\n' +
     '每篇文章以【标题】开头；【书名】【单元】写在任意位置，对其后的所有文章生效（未指定归属时可省略）。\n' +
-    '挖空在正文中写作（1）（2）…，连续的（　）会按顺序自动编号；正文可多行、可含空行。\n' +
-    '每个空配一组【题N选项A-D】【题N答案】，【题N解析】【题N知识点】可选。';
+    '题目分两类：① 挖空题——挖空在正文中写作（1）（2）…，连续的（　）会按顺序自动编号；' +
+    '② 附加题——正文中没有对应挖空的题（语法辨析、读音题、阅读选择题等），可用【题N题干】写明题干，导入后显示在正文下方。\n' +
+    '只要有任意一类题目就算有效文章，正文没有挖空也不报错。\n' +
+    '每题配一组【题N选项A-D】【题N答案】，【题N解析】【题N知识点】可选。';
 
-  const AI_PROMPT =
-    '你是一名日语阅读老师。请出一篇日语「完形填空 / 选词填空」式阅读理解题，要求：\n' +
-    '1. 正文 200-400 字，挖 5-8 个空，挖空处在正文中用（1）（2）…标出；\n' +
-    '2. 每空 4 个选项，考察语法接续、近义辨析或接续词，干扰项要有迷惑性；\n' +
-    '3. 每题给出中文解析与涉及的知识点；\n' +
-    '4. 严格按下面的格式输出，不要输出任何其他内容：\n\n' +
-    '【书名】阅读理解练习\n【单元】第一单元\n\n【标题】文章标题\n【正文】\n……（1）……（2）……\n' +
-    '【题1选项A】…\n【题1选项B】…\n【题1选项C】…\n【题1选项D】…\n【题1答案】A\n【题1解析】…\n【题1知识点】～ばかり\n\n' +
-    '（第 2 空起重复 题N选项A-D / 题N答案 / 题N解析 / 题N知识点；多篇文章之间用空行分隔）';
+  /**
+   * AI 整理提示词：按上方选择的书籍/单元动态替换【书名】【单元】。
+   * 跟随文本时保留可修改的占位词，AI 可自行命名。
+   */
+  function buildAIPrompt() {
+    let bookName = '书名';
+    let unitName = '单元名';
+    if (selBook) {
+      const book = Store.getReadingBookById(selBook);
+      if (book) {
+        bookName = book.name;
+        if (selUnit && selUnit !== '__auto__') {
+          const u = (book.units || []).find(x => x.id === selUnit);
+          if (u) unitName = u.name;
+        }
+      }
+    }
+    return '你是一名日语资料整理助手。我会给你一篇日语文章和对应的题目' +
+      '（可能包含完形填空、语法辨析、读音题、阅读选择题等）。' +
+      '请你严格按下面的格式，把资料整理成系统可导入的结构化文本，不要输出任何其他内容。\n\n' +
+      '要求：\n' +
+      '1. 正文原样保留，挖空处用（1）（2）…标出；如果原文用其他符号，请统一改成（数字）。\n' +
+      '2. 题目按顺序编号，每道题输出：选项A-D、答案、解析、知识点。\n' +
+      '3. 如果某道题在正文中没有对应挖空（如语法辨析题、读音题、阅读选择题），' +
+      '也照常输出，不要报错，系统会把它归为「附加题目」；这类题请用【题N题干】写明题目问的是什么。\n' +
+      '4. 解析用中文，知识点用「～语法」的形式。\n' +
+      '5. 严格按下面的格式输出，不要输出任何其他内容：\n\n' +
+      '【书名】' + bookName + '\n【单元】' + unitName + '\n\n' +
+      '【标题】文章标题\n【正文】\n……（1）……（2）……\n' +
+      '【题1选项A】…\n【题1选项B】…\n【题1选项C】…\n【题1选项D】…\n' +
+      '【题1答案】A\n【题1解析】…\n【题1知识点】～ばかり\n\n' +
+      '（第 2 空起重复 题N选项A-D / 题N答案 / 题N解析 / 题N知识点；' +
+      '正文外的独立题额外加一行【题N题干】；多篇文章之间用空行分隔）\n\n' +
+      '下面是我要整理的资料：\n【粘贴你的文章和题目】';
+  }
 
   /* ---------- 导入归属：下拉选已有书籍/单元 ---------- */
 
@@ -694,7 +788,7 @@
     B().setHTML(
       '<a class="back-link" href="#/reading">‹ 返回</a>' +
       '<header class="page-head"><h1>导入阅读理解</h1>' +
-      '<div class="sub">粘贴带挖空和选项的文章文本，自动解析进书架</div></header>' +
+      '<div class="sub">粘贴文章与题目文本（挖空题、正文外附加题都支持），自动解析进书架</div></header>' +
 
       '<div class="import-card">' +
       '<label>文章文本（可一次粘贴多篇批量导入）</label>' +
@@ -714,7 +808,7 @@
       '<div class="fmt-hint" id="rcScopeHint">' + scopeHint() + '</div></div>' +
 
       '<div class="rc-toolbar">' +
-      '<button class="btn btn-ink" data-rc="ai-prompt">🤖 复制 AI 出题提示词</button>' +
+      '<button class="btn btn-ink" data-rc="ai-prompt">🤖 复制 AI 整理提示词</button>' +
       '<button class="btn btn-primary" data-rc="import-parse">解析预览</button>' +
       '</div>' +
       previewHTML
@@ -734,9 +828,12 @@
         }
         const d = p.data;
         const t = previewTarget(d);
+        const parts = [];
+        if (d.blanks.length) parts.push('挖空 ' + d.blanks.length + ' 题');
+        if (d.extras.length) parts.push('附加 ' + d.extras.length + ' 题');
         return '<div class="ai-pv-item"><b>' + esc(d.title) + '</b>' +
           esc(t.bookName + ' / ' + t.unitName) +
-          ' · ' + d.blanks.length + ' 空</div>';
+          ' · ' + esc(parts.join(' · ') || '无题目') + '</div>';
       }).join('') +
       (valid.length ?
         '<button class="btn btn-ink" data-rc="import-confirm" style="margin-top:12px">一键导入 ' +
@@ -772,6 +869,10 @@
         blanks: d.blanks.map(b => ({
           no: b.no, options: b.options, answer: b.answer,
           explanation: b.explanation, points: b.points, qid: null, lastWrong: false
+        })),
+        extras: d.extras.map(q => ({
+          no: q.no, stem: q.stem || '', options: q.options, answer: q.answer,
+          explanation: q.explanation, points: q.points, qid: null, lastWrong: false
         })),
         precisionId: null,
         state: freshState()
@@ -844,11 +945,16 @@
     if (!u) return;
     const st = unitStats(u);
     if (!confirm('删除单元「' + u.name + '」？其下 ' + st.count +
-      ' 篇文章将一并删除，已同步进错题本的记录也会移除。')) return;
+      ' 篇文章（含全部挖空题与附加题）将一并删除，已同步进错题本的记录也会移除。')) return;
     Store.deleteReadingUnit(bookId, unitId);
     B().toast('已删除');
     B().refreshBadge();
-    rerender();
+    /* 在单元详情页删除后返回书籍页；在书籍页展开行删除时原地刷新 */
+    if ((location.hash || '').indexOf('#/reading/unit/') === 0) {
+      location.hash = '#/reading/book/' + encodeURIComponent(bookId);
+    } else {
+      rerender();
+    }
   }
 
   function doDelArticle(id) {
@@ -911,7 +1017,7 @@
         e.stopPropagation();
         doDelArticle(el.dataset.id);
         break;
-      case 'opt': doOpt(Number(el.dataset.no), el.dataset.letter); break;
+      case 'opt': doOpt(el.dataset.kind || 'blank', Number(el.dataset.no), el.dataset.letter); break;
       case 'mode': {
         const hit = locate();
         if (hit) {
@@ -927,7 +1033,7 @@
       }
       case 'submit': doSubmit(); break;
       case 'restart': doRestart(); break;
-      case 'mark-blank': doMarkBlank(Number(el.dataset.no)); break;
+      case 'mark-blank': doMarkBlank(el.dataset.kind || 'blank', Number(el.dataset.no)); break;
       case 'fav': {
         const hit = locate();
         if (!hit) break;
@@ -938,8 +1044,8 @@
       }
       case 'to-precision': doToPrecision(); break;
       case 'ai-prompt':
-        B().copyText(AI_PROMPT).then(
-          () => B().toast('提示词已复制，发给任意 AI 即可'),
+        B().copyText(buildAIPrompt()).then(
+          () => B().toast('提示词已复制（已带入当前书籍/单元），发给任意 AI 即可'),
           () => B().toast('复制失败，请长按手动选择'));
         break;
       case 'import-parse': doImportParse(); break;
